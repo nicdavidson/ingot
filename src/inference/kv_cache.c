@@ -30,11 +30,13 @@ InferenceCache *cache_create(const ModelConfig *cfg, int max_seq_len) {
     }
 
     // Allocate DeltaNet states (linear attention)
+    // State is [num_v_heads, head_k_dim, head_v_dim] per layer
+    // (one recurrent state matrix per value head)
     cache->num_dn_layers = num_dn;
     cache->dn_layers = calloc((size_t)num_dn, sizeof(DeltaNetState));
     for (int i = 0; i < num_dn; i++) {
         DeltaNetState *dn = &cache->dn_layers[i];
-        dn->num_heads = cfg->linear_attn.linear_num_key_heads;
+        dn->num_heads = cfg->linear_attn.linear_num_value_heads;
         dn->key_dim = cfg->linear_attn.linear_key_head_dim;
         dn->value_dim = cfg->linear_attn.linear_value_head_dim;
         size_t state_size = (size_t)dn->num_heads *
@@ -47,7 +49,7 @@ InferenceCache *cache_create(const ModelConfig *cfg, int max_seq_len) {
                     (size_t)cfg->num_key_value_heads *
                     (size_t)cfg->head_dim * sizeof(float);
     size_t dn_mem = (size_t)num_dn *
-                    (size_t)cfg->linear_attn.linear_num_key_heads *
+                    (size_t)cfg->linear_attn.linear_num_value_heads *
                     (size_t)cfg->linear_attn.linear_key_head_dim *
                     (size_t)cfg->linear_attn.linear_value_head_dim * sizeof(float);
 
