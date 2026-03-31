@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "config/config.h"
+#include "inference/inference.h"
 #include "model/model.h"
 #include "server/server.h"
 #include "tokenizer/tokenizer.h"
@@ -138,14 +139,39 @@ int main(int argc, char **argv) {
             return ret;
         }
 
-        case CMD_GENERATE:
+        case CMD_GENERATE: {
             if (!args.model_path || !args.prompt) {
                 LOG_ERROR("generate requires --model and --prompt");
                 return 1;
             }
-            LOG_INFO("generating from: %s", args.model_path);
-            // TODO: generate(args.model_path, args.prompt, args.max_tokens);
+            Model *gen_model = model_load(args.model_path);
+            if (!gen_model) {
+                LOG_ERROR("failed to load model");
+                return 1;
+            }
+
+            // Tokenize prompt
+            const Tokenizer *gen_tok = model_tokenizer(gen_model);
+            int32_t prompt_tokens[8192];
+            int num_prompt = tokenizer_encode(gen_tok, args.prompt,
+                                              strlen(args.prompt),
+                                              prompt_tokens, 8192);
+            LOG_INFO("prompt: %d tokens", num_prompt);
+
+            // Generate
+            InferenceContext *gen_ctx = inference_create(gen_model);
+            printf("\n");
+
+            inference_generate(gen_ctx, prompt_tokens, num_prompt,
+                              args.max_tokens,
+                              args.temperature, args.top_p, args.top_k,
+                              NULL, NULL);
+
+            printf("\n");
+            inference_free(gen_ctx);
+            model_free(gen_model);
             break;
+        }
 
         case CMD_CHAT:
             if (!args.model_path) {
