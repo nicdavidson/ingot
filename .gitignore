@@ -1,0 +1,26 @@
+# Build output
+build/
+ingot
+*.o
+*.d
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# Editor
+.vscode/
+*.swp
+*.swo
+*~
+
+# Model files (never commit these)
+*.bin
+*.safetensors
+*.gguf
+models/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
