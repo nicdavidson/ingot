@@ -22,4 +22,14 @@ const ModelConfig *model_config(const Model *model);
 // Get model tokenizer.
 const Tokenizer *model_tokenizer(const Model *model);
 
+// Get a pointer to a shared weight tensor by name.
+// Returns pointer into mmap'd region, or NULL if not found.
+// The name should match the weight_index.json key (e.g., "layers.0.input_layernorm.weight").
+const void *model_get_weight(const Model *model, const char *name, size_t *out_size);
+
+// Get a pointer to expert weight data for a specific expert in a layer.
+// Returns pointer into mmap'd expert file, or NULL if not found.
+const void *model_get_expert(const Model *model, int layer_idx, int expert_idx,
+                             size_t *out_stride);
+
 #endif

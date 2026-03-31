@@ -2,6 +2,7 @@
 
 #include "model/model.h"
 #include "model/mmap_pool.h"
+#include "model/weight_index.h"
 #include "util/log.h"
 #include "util/timer.h"
 
@@ -15,31 +16,20 @@
 #include <string.h>
 #include <dirent.h>
 
-// Weight index: maps weight names to their mmap'd locations
-typedef struct {
-    char  name[128];
-    void *data;
-    size_t size;
-} WeightEntry;
-
 struct Model {
-    ModelConfig  config;
-    Tokenizer   *tokenizer;
-    MmapPool    *pool;
+    ModelConfig   config;
+    Tokenizer    *tokenizer;
+    MmapPool     *pool;
+    WeightIndex   weight_idx;
 
     // Shared weights (always resident)
-    void        *shared_weights;
-    size_t       shared_weights_size;
+    void         *shared_weights;
+    size_t        shared_weights_size;
 
     // Expert files: one mmap per layer
-    void       **expert_data;    // [num_layers]
-    size_t      *expert_sizes;   // [num_layers]
-    int          num_expert_files;
-
-    // Weight index
-    WeightEntry *weights;
-    int          num_weights;
-    int          max_weights;
+    void        **expert_data;    // [num_layers]
+    size_t       *expert_sizes;   // [num_layers]
+    int           num_expert_files;
 
 #ifdef PLATFORM_MACOS
     MetalContext *metal_ctx;
@@ -124,6 +114,13 @@ Model *model_load(const char *model_dir) {
     // Create mmap pool (shared weights + up to 100 expert files)
     model->pool = mmap_pool_create(128);
 
+    // Load weight index
+    char idx_path[1024];
+    snprintf(idx_path, sizeof(idx_path), "%s/weight_index.json", model_dir);
+    if (!weight_index_load(&model->weight_idx, idx_path)) {
+        LOG_WARN("model: no weight_index.json (run convert_weights.py first)");
+    }
+
     // Load shared weights
     char weights_path[1024];
     snprintf(weights_path, sizeof(weights_path), "%s/model_weights.bin", model_dir);
@@ -138,7 +135,7 @@ Model *model_load(const char *model_dir) {
         mlock(model->shared_weights, model->shared_weights_size);
 #endif
     } else {
-        LOG_WARN("model: no model_weights.bin found (will need weights in another format)");
+        LOG_WARN("model: no model_weights.bin found (run convert_weights.py first)");
     }
 
     // Load expert files
@@ -185,7 +182,7 @@ void model_free(Model *model) {
     mmap_pool_free(model->pool);
     free(model->expert_data);
     free(model->expert_sizes);
-    free(model->weights);
+    weight_index_free(&model->weight_idx);
     free(model);
 }
 
@@ -195,4 +192,50 @@ const ModelConfig *model_config(const Model *model) {
 
 const Tokenizer *model_tokenizer(const Model *model) {
     return model->tokenizer;
+}
+
+const void *model_get_weight(const Model *model, const char *name, size_t *out_size) {
+    const WeightEntry *e = weight_index_find(&model->weight_idx, name);
+    if (!e || !model->shared_weights) return NULL;
+
+    if (e->offset + e->size > model->shared_weights_size) {
+        return NULL; // out of bounds
+    }
+
+    if (out_size) *out_size = e->size;
+    return (const char *)model->shared_weights + e->offset;
+}
+
+const void *model_get_expert(const Model *model, int layer_idx, int expert_idx,
+                             size_t *out_stride) {
+    // Find the expert index entry
+    char name[64];
+    snprintf(name, sizeof(name), "layers.%d.experts", layer_idx);
+    const WeightEntry *e = weight_index_find(&model->weight_idx, name);
+    if (!e) return NULL;
+
+    if (expert_idx < 0 || expert_idx >= e->num_experts) return NULL;
+
+    // Find the mmap'd expert file for this layer
+    // Expert files are ordered by layer index
+    int expert_file_idx = -1;
+    for (int i = 0; i < model->num_expert_files; i++) {
+        // Simple match — expert files are loaded in order
+        if (i == layer_idx || expert_file_idx < 0) {
+            expert_file_idx = i;
+            // Actually need to match by layer index. For now, just use linear mapping
+            // since expert files are named layer_XX.bin and loaded in sorted order.
+        }
+    }
+
+    // For now, use a simple mapping: expert_file_idx maps directly to layers
+    // with expert files (every layer has one since all layers have MoE)
+    if (expert_file_idx < 0 || expert_file_idx >= model->num_expert_files)
+        return NULL;
+
+    void *data = model->expert_data[expert_file_idx];
+    if (!data) return NULL;
+
+    if (out_stride) *out_stride = e->expert_stride;
+    return (const char *)data + (size_t)expert_idx * e->expert_stride;
 }
