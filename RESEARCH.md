@@ -212,45 +212,27 @@ Common pitfalls in MoE inference servers that Ingot must avoid:
 
 ## 8. Development Environment
 
-### Build Machine: Crucible (Linux)
-- **Location:** `/data/projects/ingot/`
-- **OS:** Linux 6.8.0-101-generic (Ubuntu)
-- **CPU:** Intel i7-6700K
-- **RAM:** 32GB
-- **GPU:** GTX 1080 + Tesla P40 (NOT used for this project — Metal only)
-- **Role:** Code editing, git, CI. The code is written here.
-- **Editor:** VSCode (Claude Code / Milo working in terminal)
+### Build Machine (Linux)
+- **Role:** Code editing, git, CI
+- **Note:** No Metal support — pure C subset only
 
-### Test Machine: MacBook Pro M5 Max (macOS)
-- **SSH:** `ssh nic@macbook-pro.local`
-- **CPU/GPU:** Apple M5 Max (40-core GPU, 48GB unified memory)
-- **SSD:** ~7 GB/s read, 1.1TB free
-- **Models:**
-  - `/Users/nic/models/Qwen3.5-397B-A17B-4bit/` — 397B (pre-converted format)
-  - `/Users/nic/models/Qwen3.5-122B-A10B/` — 122B, downloading (raw safetensors)
+### Test Machine: MacBook Pro with Apple Silicon (macOS)
 - **Role:** Compilation (requires Metal framework) and runtime testing
 - **Build:** `make` (clang with `-framework Metal -framework Foundation`)
 
 ### Workflow
-1. **Edit on Crucible** — VSCode terminal, Milo assists
-2. **Push to GitHub** — public repo under Captain's account
-3. **Pull on Mac** — `git pull` in project directory
-4. **Compile on Mac** — `make` (must be on macOS for Metal headers)
-5. **Test on Mac** — `./ingot serve --model /path --port 8090`, curl, OpenCode
-
-### SSH Gotchas
-- **Long-running commands timeout.** Don't `ssh ... "./ingot serve"` and wait. Background it: `nohup ./ingot serve &`
-- **Use short SSH commands.** `make`, `./ingot --help`, quick curls. Not 2-minute inference runs.
-- **For interactive testing,** give Captain the command to run manually on the Mac.
-- **Hostname:** `macbook-pro.local` (mDNS). Confirmed working.
+1. Edit on Linux build machine
+2. Push to GitHub
+3. Pull on Mac — `git pull`
+4. Compile on Mac — `make` (must be on macOS for Metal headers)
+5. Test on Mac — `./ingot serve --model /path --port 8090`
 
 ### Cross-Compilation Note
-The code CANNOT be compiled on Crucible (Linux). Metal framework, Foundation framework, and Objective-C ARC are macOS-only. We write the code on Crucible but always compile on the Mac. Syntax checking on Crucible is limited to `clang -fsyntax-only` for the pure C files.
+The code CANNOT be compiled on Linux. Metal framework, Foundation framework, and Objective-C ARC are macOS-only. Code is written on Linux but always compiled on the Mac. Syntax checking on Linux is limited to `clang -fsyntax-only` for the pure C files.
 
-### Model Files on Mac
+### Model Files
 - **Pre-converted (397B):** `model_weights.bin` (5.5GB shared) + `packed_experts/` (60 layer files, 203GB total) + `vocab.bin` (BPET tokenizer)
-- **HuggingFace safetensors (122B):** Downloading. 39 shards. Will need conversion via `tools/convert_weights.py`
-- **HuggingFace safetensors (397B):** Also present (46 shards, 416GB). Could re-convert if needed.
+- **HuggingFace safetensors:** Raw shards, need conversion via `tools/convert_weights.py`
 
 ---
 
