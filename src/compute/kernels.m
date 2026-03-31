@@ -64,6 +64,7 @@ static void dispatch_1d(MetalContext *ctx, int pipe_idx,
     [cb waitUntilCompleted];
 }
 
+__attribute__((unused))
 static void dispatch_1d_with_floats(MetalContext *ctx, int pipe_idx,
                                      void *bufs[], int nbufs,
                                      void *params_data, size_t params_size,

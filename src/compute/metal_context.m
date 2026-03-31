@@ -49,7 +49,7 @@ static id<MTLComputePipelineState> compile_function(id<MTLDevice> device,
     NSError *error = nil;
     NSString *src = [NSString stringWithUTF8String:source];
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    opts.fastMathEnabled = YES;
+    opts.mathMode = MTLMathModeFast;
 
     id<MTLLibrary> lib = [device newLibraryWithSource:src options:opts error:&error];
     if (!lib) {
@@ -170,8 +170,7 @@ void *metal_alloc_buffer(MetalContext *ctx, size_t size) {
 
 void metal_free_buffer(void *buffer) {
     if (!buffer) return;
-    id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)buffer;
-    buf = nil; // ARC releases
+    (void)(__bridge_transfer id<MTLBuffer>)buffer; // ARC releases
 }
 
 void metal_sync(MetalContext *ctx) {
