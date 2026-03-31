@@ -405,9 +405,13 @@ Tokenizer *tokenizer_load(const char *model_dir) {
         return NULL;
     }
 
-    // Load added tokens from tokenizer_config.json (special tokens)
-    snprintf(path, sizeof(path), "%s/tokenizer_config.json", model_dir);
-    load_added_tokens(tok, path);
+    // Load added tokens — try added_tokens.json first (extracted),
+    // then tokenizer_config.json (HuggingFace format)
+    snprintf(path, sizeof(path), "%s/added_tokens.json", model_dir);
+    if (!load_added_tokens(tok, path)) {
+        snprintf(path, sizeof(path), "%s/tokenizer_config.json", model_dir);
+        load_added_tokens(tok, path);
+    }
 
     // Resolve special token IDs
     tok->eos_id = hashmap_get(&tok->token_to_id, "<|endoftext|>", -1);
