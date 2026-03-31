@@ -322,11 +322,18 @@ static bool load_added_tokens(Tokenizer *tok, const char *path) {
         return false;
     }
 
+    // Try "added_tokens_decoder" (tokenizer_config.json format),
+    // otherwise treat root object as the token map (added_tokens.json format)
     int atd_idx = json_get(&doc, 0, "added_tokens_decoder");
     if (atd_idx < 0) {
-        free(tokens);
-        free(json);
-        return false;
+        // Root object is the map
+        if (doc.tokens[0].type == JSON_OBJECT) {
+            atd_idx = 0;
+        } else {
+            free(tokens);
+            free(json);
+            return false;
+        }
     }
 
     int added = 0;
