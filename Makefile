@@ -20,19 +20,24 @@ ifeq ($(UNAME),Darwin)
   OC_SRCS := $(shell find $(SRC_DIR) -name '*.m')
   C_OBJS  := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(C_SRCS))
   OC_OBJS := $(patsubst $(SRC_DIR)/%.m,$(BUILD)/%.o,$(OC_SRCS))
-  OBJS    := $(C_OBJS) $(OC_OBJS)
+
+  # Shader embedding
+  SHADER_SRC := $(BUILD)/shader_strings.c
+  SHADER_OBJ := $(BUILD)/shader_strings.o
+
+  OBJS    := $(C_OBJS) $(OC_OBJS) $(SHADER_OBJ)
   LDFLAGS += $(FRAMEWORKS)
 else
-  # Linux: pure C subset only (Phase 1 testing)
+  # Linux: pure C subset only (no Metal, no .m files)
   CFLAGS += -DPLATFORM_LINUX
-  C_SRCS := $(shell find $(SRC_DIR) -name '*.c')
+  C_SRCS := $(shell find $(SRC_DIR) -name '*.c' ! -path '*/compute/*')
   OBJS   := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(C_SRCS))
 endif
 
 # Targets
 TARGET := ingot
 
-.PHONY: all clean debug release
+.PHONY: all clean debug release test
 
 all: release
 
@@ -56,17 +61,25 @@ $(BUILD)/%.o: $(SRC_DIR)/%.m
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(OBJCFLAGS) -MMD -MP -c $< -o $@
 
+# Embed Metal shaders as C strings (macOS only)
+$(SHADER_SRC): $(wildcard $(SRC_DIR)/compute/shaders/*.metal) tools/embed_shaders.sh
+	@mkdir -p $(dir $@)
+	bash tools/embed_shaders.sh > $@
+
+$(SHADER_OBJ): $(SHADER_SRC)
+	$(CC) -std=c17 -c $< -o $@
+
 # Test targets
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(patsubst tests/%.c,$(BUILD)/tests/%,$(TEST_SRCS))
 
-# Utility objects (shared by main and tests)
-UTIL_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(shell find $(SRC_DIR)/util $(SRC_DIR)/config $(SRC_DIR)/tokenizer $(SRC_DIR)/chat -name '*.c' 2>/dev/null))
+# Objects shared by tests (pure C modules only)
+TEST_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(shell find $(SRC_DIR)/util $(SRC_DIR)/config $(SRC_DIR)/tokenizer $(SRC_DIR)/chat $(SRC_DIR)/model -name '*.c' 2>/dev/null))
 
 test: $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "--- $$t ---"; $$t || exit 1; done
 
-$(BUILD)/tests/%: tests/%.c $(UTIL_OBJS)
+$(BUILD)/tests/%: tests/%.c $(TEST_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $^ -o $@
 
