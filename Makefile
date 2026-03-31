@@ -75,14 +75,14 @@ TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(patsubst tests/%.c,$(BUILD)/tests/%,$(TEST_SRCS))
 
 # Objects shared by tests (pure C modules only)
-TEST_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(shell find $(SRC_DIR)/util $(SRC_DIR)/config $(SRC_DIR)/tokenizer $(SRC_DIR)/chat $(SRC_DIR)/model -name '*.c' 2>/dev/null))
+TEST_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(shell find $(SRC_DIR)/util $(SRC_DIR)/config $(SRC_DIR)/tokenizer $(SRC_DIR)/chat $(SRC_DIR)/model $(SRC_DIR)/inference $(SRC_DIR)/server -name '*.c' 2>/dev/null))
 
 test: $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "--- $$t ---"; $$t || exit 1; done
 
 $(BUILD)/tests/%: tests/%.c $(TEST_OBJS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
 clean:
 	rm -rf $(BUILD) $(TARGET)

@@ -3,6 +3,8 @@
 #include <string.h>
 
 #include "config/config.h"
+#include "model/model.h"
+#include "server/server.h"
 #include "tokenizer/tokenizer.h"
 #include "util/log.h"
 #include "util/timer.h"
@@ -120,14 +122,21 @@ int main(int argc, char **argv) {
     log_init();
 
     switch (args.cmd) {
-        case CMD_SERVE:
+        case CMD_SERVE: {
             if (!args.model_path) {
                 LOG_ERROR("serve requires --model");
                 return 1;
             }
-            LOG_INFO("serving model: %s on port %d", args.model_path, args.port);
-            // TODO: server_run(args.model_path, args.port);
-            break;
+            LOG_INFO("loading model: %s", args.model_path);
+            Model *model = model_load(args.model_path);
+            if (!model) {
+                LOG_ERROR("failed to load model");
+                return 1;
+            }
+            int ret = server_run(model, args.port);
+            model_free(model);
+            return ret;
+        }
 
         case CMD_GENERATE:
             if (!args.model_path || !args.prompt) {
