@@ -304,6 +304,81 @@ static bool load_merges(Tokenizer *tok, const char *path) {
     return true;
 }
 
+// Load added_tokens from tokenizer_config.json
+// These are special tokens (eos, im_start, etc.) not in vocab.json
+static bool load_added_tokens(Tokenizer *tok, const char *path) {
+    size_t len;
+    char *json = read_file(path, &len);
+    if (!json) return false; // optional file
+
+    int max_tokens = 8192;
+    JsonToken *tokens = calloc((size_t)max_tokens, sizeof(JsonToken));
+    JsonDoc doc;
+    if (!json_parse(&doc, json, len, tokens, max_tokens)) {
+        free(tokens);
+        free(json);
+        return false;
+    }
+
+    int atd_idx = json_get(&doc, 0, "added_tokens_decoder");
+    if (atd_idx < 0) {
+        free(tokens);
+        free(json);
+        return false;
+    }
+
+    int added = 0;
+    int key_idx = atd_idx + 1;
+    for (int i = 0; i < doc.tokens[atd_idx].children; i++) {
+        if (key_idx < 0 || key_idx >= doc.num_tokens) break;
+
+        // Key is the token ID as a string
+        char id_str[32];
+        json_string(&doc, key_idx, id_str, sizeof(id_str));
+        int id = atoi(id_str);
+
+        // Value is an object with "content" field
+        int val_idx = key_idx + 1;
+        int content_idx = json_get(&doc, val_idx, "content");
+        if (content_idx >= 0) {
+            char content[256];
+            json_string(&doc, content_idx, content, sizeof(content));
+
+            // Add to vocab if not already present
+            if (id >= 0 && hashmap_get(&tok->token_to_id, content, -1) < 0) {
+                // Extend id_to_token array if needed
+                if (id >= tok->vocab_size) {
+                    int new_size = id + 1;
+                    char **new_arr = realloc(tok->id_to_token,
+                                            (size_t)new_size * sizeof(char *));
+                    if (new_arr) {
+                        memset(new_arr + tok->vocab_size, 0,
+                               (size_t)(new_size - tok->vocab_size) * sizeof(char *));
+                        tok->id_to_token = new_arr;
+                        tok->vocab_size = new_size;
+                    }
+                }
+                if (id < tok->vocab_size) {
+                    free(tok->id_to_token[id]);
+                    tok->id_to_token[id] = strdup(content);
+                    hashmap_put(&tok->token_to_id, content, id);
+                    added++;
+                }
+            }
+        }
+
+        key_idx = doc.tokens[key_idx].next;
+        if (key_idx < 0) break;
+    }
+
+    free(tokens);
+    free(json);
+
+    if (added > 0)
+        LOG_INFO("tokenizer: loaded %d added tokens", added);
+    return true;
+}
+
 // --- Public API ---
 
 Tokenizer *tokenizer_load(const char *model_dir) {
@@ -327,6 +402,10 @@ Tokenizer *tokenizer_load(const char *model_dir) {
         tokenizer_free(tok);
         return NULL;
     }
+
+    // Load added tokens from tokenizer_config.json (special tokens)
+    snprintf(path, sizeof(path), "%s/tokenizer_config.json", model_dir);
+    load_added_tokens(tok, path);
 
     // Resolve special token IDs
     tok->eos_id = hashmap_get(&tok->token_to_id, "<|endoftext|>", -1);
