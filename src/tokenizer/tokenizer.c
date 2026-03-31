@@ -311,10 +311,12 @@ static bool load_added_tokens(Tokenizer *tok, const char *path) {
     char *json = read_file(path, &len);
     if (!json) return false; // optional file
 
-    int max_tokens = 8192;
+    int max_tokens = 32768;
     JsonToken *tokens = calloc((size_t)max_tokens, sizeof(JsonToken));
+    if (!tokens) { free(json); return false; }
     JsonDoc doc;
     if (!json_parse(&doc, json, len, tokens, max_tokens)) {
+        LOG_WARN("tokenizer: failed to parse %s (may be too large)", path);
         free(tokens);
         free(json);
         return false;
