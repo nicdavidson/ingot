@@ -30,6 +30,7 @@ ifeq ($(UNAME),Darwin)
 else
   # Linux: pure C subset only (no Metal, no .m files)
   CFLAGS += -DPLATFORM_LINUX
+  LDFLAGS += -lm
   C_SRCS := $(shell find $(SRC_DIR) -name '*.c' ! -path '*/compute/*')
   OBJS   := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(C_SRCS))
 endif
