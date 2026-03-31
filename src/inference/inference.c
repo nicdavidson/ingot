@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "inference/inference.h"
+#include "inference/attention.h"
 #include "inference/kv_cache.h"
 #include "inference/sampler.h"
 #include "inference/dequant.h"
@@ -37,6 +38,8 @@ struct InferenceContext {
     ScratchBuffers  scratch;
     Arena           arena;
     int             position;  // current token position
+    int             kv_idx;    // current KV layer index (for SWA layers)
+    int             dn_idx;    // current DeltaNet layer index
 };
 
 static void alloc_scratch(ScratchBuffers *s, const ModelConfig *cfg, int max_seq) {
@@ -217,12 +220,23 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     memcpy(s->residual, s->hidden, (size_t)H * sizeof(float));
     cpu_rmsnorm(s->norm_out, s->hidden, norm_weight, H, cfg->rms_norm_eps);
 
-    // 2-4. Attention projections (Q, K, V)
-    // Note: for now, skip actual attention since weight naming isn't finalized
-    // We'll run the MoE path to test expert weight loading first
+    // 2-9. Attention (SWA or DeltaNet depending on layer type)
+    float *attn_result = arena_alloc(&ctx->arena, (size_t)H * sizeof(float));
 
-    // Skip to MoE (just add residual back for now)
-    // This will be filled in when attention weights are properly mapped
+    if (cfg->layer_types && cfg->layer_types[layer_idx] == LAYER_FULL_ATTENTION) {
+        attention_swa_forward(attn_result, s->norm_out, ctx->model, cfg,
+                             ctx->cache, layer_idx, ctx->kv_idx, ctx->position);
+        ctx->kv_idx++;
+    } else {
+        attention_deltanet_forward(attn_result, s->norm_out, ctx->model, cfg,
+                                   ctx->cache, layer_idx, ctx->dn_idx, ctx->position);
+        ctx->dn_idx++;
+    }
+
+    // Add attention output to residual
+    for (int i = 0; i < H; i++) {
+        s->hidden[i] = s->residual[i] + attn_result[i];
+    }
 
     // 10. Post-attention layernorm
     snprintf(name, sizeof(name), "layers.%d.post_attention_layernorm.weight", layer_idx);
@@ -418,6 +432,8 @@ int inference_generate(InferenceContext *ctx,
     // Process prompt tokens (prefill)
     for (int i = 0; i < num_prompt_tokens; i++) {
         ctx->position = i;
+        ctx->kv_idx = 0;
+        ctx->dn_idx = 0;
         embed_token(ctx, prompt_tokens[i]);
 
         for (int l = 0; l < cfg->num_hidden_layers; l++) {
@@ -434,6 +450,8 @@ int inference_generate(InferenceContext *ctx,
 
     for (int t = 0; t < max_tokens; t++) {
         ctx->position = num_prompt_tokens + t;
+        ctx->kv_idx = 0;
+        ctx->dn_idx = 0;
 
         embed_token(ctx, next_token);
 

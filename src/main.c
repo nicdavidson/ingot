@@ -33,6 +33,12 @@ typedef struct {
     int      top_k;
 } Args;
 
+static void gen_print_token(int32_t id, const char *text, void *ud) {
+    (void)id; (void)ud;
+    printf("%s", text);
+    fflush(stdout);
+}
+
 static void print_usage(const char *prog) {
     fprintf(stderr,
         "ingot — MoE inference engine for Apple Silicon\n"
@@ -158,14 +164,14 @@ int main(int argc, char **argv) {
                                               prompt_tokens, 8192);
             LOG_INFO("prompt: %d tokens", num_prompt);
 
-            // Generate
+            // Generate with print callback
             InferenceContext *gen_ctx = inference_create(gen_model);
             printf("\n");
 
             inference_generate(gen_ctx, prompt_tokens, num_prompt,
                               args.max_tokens,
                               args.temperature, args.top_p, args.top_k,
-                              NULL, NULL);
+                              gen_print_token, NULL);
 
             printf("\n");
             inference_free(gen_ctx);
