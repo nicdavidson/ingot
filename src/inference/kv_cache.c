@@ -31,7 +31,12 @@ InferenceCache *cache_create(const ModelConfig *cfg, int max_seq_len) {
 
     // Allocate DeltaNet states (linear attention)
     // State is [num_v_heads, head_k_dim, head_v_dim] per layer
-    // (one recurrent state matrix per value head)
+    // Plus conv1d state [conv_dim, kernel_size-1]
+    int key_dim_total = cfg->linear_attn.linear_num_key_heads * cfg->linear_attn.linear_key_head_dim;
+    int val_dim_total = cfg->linear_attn.linear_num_value_heads * cfg->linear_attn.linear_value_head_dim;
+    int conv_dim = key_dim_total * 2 + val_dim_total;
+    int kernel_size = cfg->linear_attn.linear_conv_kernel_dim;
+
     cache->num_dn_layers = num_dn;
     cache->dn_layers = calloc((size_t)num_dn, sizeof(DeltaNetState));
     for (int i = 0; i < num_dn; i++) {
@@ -39,10 +44,13 @@ InferenceCache *cache_create(const ModelConfig *cfg, int max_seq_len) {
         dn->num_heads = cfg->linear_attn.linear_num_value_heads;
         dn->key_dim = cfg->linear_attn.linear_key_head_dim;
         dn->value_dim = cfg->linear_attn.linear_value_head_dim;
+        dn->conv_dim = conv_dim;
+        dn->kernel_size = kernel_size;
         size_t state_size = (size_t)dn->num_heads *
                             (size_t)dn->key_dim *
                             (size_t)dn->value_dim * sizeof(float);
         dn->S = calloc(1, state_size);
+        dn->conv_state = calloc((size_t)conv_dim * (size_t)(kernel_size - 1), sizeof(float));
     }
 
     size_t kv_mem = (size_t)num_kv * 2 * (size_t)max_seq_len *
@@ -91,6 +99,10 @@ float *cache_dn_get(InferenceCache *cache, int layer_idx) {
     return cache->dn_layers[layer_idx].S;
 }
 
+float *cache_dn_conv_get(InferenceCache *cache, int layer_idx) {
+    return cache->dn_layers[layer_idx].conv_state;
+}
+
 void cache_reset(InferenceCache *cache) {
     for (int i = 0; i < cache->num_kv_layers; i++) {
         KVLayer *kv = &cache->kv_layers[i];
@@ -105,6 +117,8 @@ void cache_reset(InferenceCache *cache) {
         size_t sz = (size_t)dn->num_heads * (size_t)dn->key_dim *
                     (size_t)dn->value_dim * sizeof(float);
         memset(dn->S, 0, sz);
+        size_t conv_sz = (size_t)dn->conv_dim * (size_t)(dn->kernel_size - 1) * sizeof(float);
+        memset(dn->conv_state, 0, conv_sz);
     }
 }
 
@@ -117,6 +131,7 @@ void cache_free(InferenceCache *cache) {
     free(cache->kv_layers);
     for (int i = 0; i < cache->num_dn_layers; i++) {
         free(cache->dn_layers[i].S);
+        free(cache->dn_layers[i].conv_state);
     }
     free(cache->dn_layers);
     free(cache);

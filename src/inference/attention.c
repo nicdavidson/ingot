@@ -220,18 +220,37 @@ void attention_deltanet_forward(
     snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_qkv", layer_idx);
     q4_proj(qkv, hidden, model, base, conv_dim, H);
 
-    // 2. Causal conv1d (simplified: for single-token, just apply conv weights)
-    // Conv1d weight is [conv_dim, kernel_size, 1] BF16
-    // For single-token decode, this is a dot product with conv state
+    // 2. Causal conv1d with state tracking
+    // Conv1d weight is [conv_dim, kernel_size, 1] BF16 (depthwise)
+    // For single-token: shift conv_state left, append new qkv, convolve, SiLU
     int kernel_size = cfg->linear_attn.linear_conv_kernel_dim; // typically 4
     float *conv_weight = calloc((size_t)conv_dim * (size_t)kernel_size, sizeof(float));
     snprintf(wname, sizeof(wname), "layers.%d.linear_attn.conv1d.weight", layer_idx);
     load_bf16(conv_weight, model, wname, conv_dim * kernel_size);
 
-    // For now, skip conv state tracking and just pass qkv through SiLU
-    // TODO: implement proper conv state caching for multi-token generation
-    for (int i = 0; i < conv_dim; i++) {
-        qkv[i] = qkv[i] / (1.0f + expf(-qkv[i])); // SiLU
+    float *conv_state = cache_dn_conv_get(cache, dn_layer_idx);
+    int state_len = kernel_size - 1; // conv_state holds last (kernel_size-1) values
+
+    // For each channel: convolve over [conv_state..., current_qkv]
+    for (int c = 0; c < conv_dim; c++) {
+        float *cs = conv_state + c * state_len;
+        float *cw = conv_weight + c * kernel_size;
+
+        // Convolution: sum over kernel window
+        float sum = 0.0f;
+        for (int k = 0; k < state_len; k++) {
+            sum += cs[k] * cw[k];
+        }
+        sum += qkv[c] * cw[state_len]; // current value × last kernel weight
+
+        // Shift state: drop oldest, append current
+        for (int k = 0; k < state_len - 1; k++) {
+            cs[k] = cs[k + 1];
+        }
+        if (state_len > 0) cs[state_len - 1] = qkv[c];
+
+        // SiLU activation
+        qkv[c] = sum / (1.0f + expf(-sum));
     }
 
     // 3. Split QKV

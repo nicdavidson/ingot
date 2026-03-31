@@ -313,8 +313,17 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     snprintf(bname, sizeof(bname), "layers.%d.mlp.shared_expert.down_proj.biases", layer_idx);
     q4_matmul(ctx, s->expert_out, ffn_mid, name, sname, bname, H, moe_dim, 64);
 
-    // Add shared expert output to hidden
-    for (int i = 0; i < H; i++) s->hidden[i] = s->residual[i] + s->expert_out[i];
+    // Apply shared_expert_gate: sigmoid gate that weights the shared expert
+    float shared_gate_val = 1.0f;
+    snprintf(name, sizeof(name), "layers.%d.mlp.shared_expert_gate.weight", layer_idx);
+    snprintf(sname, sizeof(sname), "layers.%d.mlp.shared_expert_gate.scales", layer_idx);
+    snprintf(bname, sizeof(bname), "layers.%d.mlp.shared_expert_gate.biases", layer_idx);
+    float gate_scalar = 0.0f;
+    q4_matmul(ctx, &gate_scalar, s->norm_out, name, sname, bname, 1, H, 64);
+    shared_gate_val = 1.0f / (1.0f + expf(-gate_scalar)); // sigmoid
+
+    // Add gated shared expert output to residual
+    for (int i = 0; i < H; i++) s->hidden[i] = s->residual[i] + shared_gate_val * s->expert_out[i];
 
     // 14. Routed experts
     moe_dim = cfg->moe_intermediate_size;

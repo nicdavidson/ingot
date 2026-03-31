@@ -20,12 +20,15 @@ typedef struct {
 } KVLayer;
 
 // DeltaNet recurrent state for linear attention layers.
-// One state matrix per head per layer.
+// One state matrix per head per layer, plus conv1d state.
 typedef struct {
     float  *S;           // [num_heads, key_dim, value_dim]
+    float  *conv_state;  // [conv_dim, kernel_size-1] — causal conv history
     int     num_heads;
     int     key_dim;
     int     value_dim;
+    int     conv_dim;    // key_dim*2 + value_dim (QKV fused)
+    int     kernel_size;
 } DeltaNetState;
 
 // Full cache for all layers
@@ -50,8 +53,11 @@ void cache_kv_append(InferenceCache *cache, int layer_idx,
 void cache_kv_get(const InferenceCache *cache, int layer_idx,
                   const float **k, const float **v, int *out_seq_len);
 
-// Get DeltaNet state for a given linear attention layer.
+// Get DeltaNet recurrent state for a given linear attention layer.
 float *cache_dn_get(InferenceCache *cache, int layer_idx);
+
+// Get DeltaNet conv1d state for a given linear attention layer.
+float *cache_dn_conv_get(InferenceCache *cache, int layer_idx);
 
 // Reset cache (new conversation).
 void cache_reset(InferenceCache *cache);
