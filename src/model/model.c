@@ -5,6 +5,11 @@
 #include "util/log.h"
 #include "util/timer.h"
 
+#ifdef PLATFORM_MACOS
+#include "compute/metal_context.h"
+#include <sys/mman.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,8 +42,8 @@ struct Model {
     int          max_weights;
 
 #ifdef PLATFORM_MACOS
-    void        *metal_ctx;        // MetalContext*
-    void        *shared_mtl_buf;   // Metal buffer wrapping shared weights
+    MetalContext *metal_ctx;
+    void         *shared_mtl_buf;  // Metal buffer wrapping shared weights
 #endif
 };
 
@@ -141,7 +146,6 @@ Model *model_load(const char *model_dir) {
 
 #ifdef PLATFORM_MACOS
     // Initialize Metal
-    extern MetalContext *metal_init(void);
     model->metal_ctx = metal_init();
     if (!model->metal_ctx) {
         LOG_ERROR("model: Metal initialization failed");
@@ -151,7 +155,6 @@ Model *model_load(const char *model_dir) {
 
     // Wrap shared weights as Metal buffer (zero-copy)
     if (model->shared_weights) {
-        extern void *metal_wrap_buffer(MetalContext *, void *, size_t);
         model->shared_mtl_buf = metal_wrap_buffer(
             model->metal_ctx,
             model->shared_weights,
@@ -170,11 +173,9 @@ void model_free(Model *model) {
 
 #ifdef PLATFORM_MACOS
     if (model->shared_mtl_buf) {
-        extern void metal_free_buffer(void *);
         metal_free_buffer(model->shared_mtl_buf);
     }
     if (model->metal_ctx) {
-        extern void metal_free(MetalContext *);
         metal_free(model->metal_ctx);
     }
 #endif
