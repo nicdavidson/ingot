@@ -2,7 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "config/config.h"
+#include "tokenizer/tokenizer.h"
 #include "util/log.h"
+#include "util/timer.h"
 
 typedef enum {
     CMD_NONE,
@@ -153,14 +156,58 @@ int main(int argc, char **argv) {
             // TODO: convert(args.input_path, args.output_path);
             break;
 
-        case CMD_TOKENIZE:
+        case CMD_TOKENIZE: {
             if (!args.model_path || !args.text) {
                 LOG_ERROR("tokenize requires --model and --text");
                 return 1;
             }
-            LOG_INFO("tokenizing with: %s", args.model_path);
-            // TODO: tokenize(args.model_path, args.text);
+
+            uint64_t t0 = timer_now_ns();
+            Tokenizer *tok = tokenizer_load(args.model_path);
+            if (!tok) {
+                LOG_ERROR("failed to load tokenizer from %s", args.model_path);
+                return 1;
+            }
+            uint64_t t1 = timer_now_ns();
+            LOG_INFO("tokenizer loaded in %.1f ms (vocab=%d)",
+                     timer_elapsed_ms(t0, t1), tokenizer_vocab_size(tok));
+
+            // Encode
+            size_t text_len = strlen(args.text);
+            int32_t tokens[8192];
+            t0 = timer_now_ns();
+            int n = tokenizer_encode(tok, args.text, text_len, tokens, 8192);
+            t1 = timer_now_ns();
+
+            printf("Input:  \"%s\" (%zu bytes)\n", args.text, text_len);
+            printf("Tokens: %d (encoded in %.3f ms)\n\n", n,
+                   timer_elapsed_ms(t0, t1));
+
+            // Print token IDs and their decoded text
+            printf("ID        Decoded\n");
+            printf("--------- -------\n");
+            for (int i = 0; i < n; i++) {
+                const char *decoded = tokenizer_decode(tok, tokens[i]);
+                printf("%-9d \"%s\"\n", tokens[i], decoded);
+            }
+
+            // Decode back to string
+            char decoded_buf[32768];
+            tokenizer_decode_batch(tok, tokens, n, decoded_buf, sizeof(decoded_buf));
+            printf("\nRound-trip: \"%s\"\n", decoded_buf);
+
+            // Check round-trip
+            if (strcmp(args.text, decoded_buf) == 0) {
+                printf("Round-trip: OK (exact match)\n");
+            } else {
+                printf("Round-trip: MISMATCH\n");
+                printf("  Expected: %zu bytes\n", text_len);
+                printf("  Got:      %zu bytes\n", strlen(decoded_buf));
+            }
+
+            tokenizer_free(tok);
             break;
+        }
 
         case CMD_NONE:
             break;
