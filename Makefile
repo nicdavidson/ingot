@@ -61,7 +61,7 @@ TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(patsubst tests/%.c,$(BUILD)/tests/%,$(TEST_SRCS))
 
 # Utility objects (shared by main and tests)
-UTIL_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(shell find $(SRC_DIR)/util $(SRC_DIR)/config -name '*.c' 2>/dev/null))
+UTIL_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(shell find $(SRC_DIR)/util $(SRC_DIR)/config $(SRC_DIR)/tokenizer -name '*.c' 2>/dev/null))
 
 test: $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "--- $$t ---"; $$t || exit 1; done
