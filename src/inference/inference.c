@@ -408,8 +408,27 @@ static void embed_token(InferenceContext *ctx, int32_t token_id) {
 
 static void compute_logits(InferenceContext *ctx) {
     const ModelConfig *cfg = model_config(ctx->model);
+
+    // Final RMSNorm before logit projection
+    char norm_name[] = "norm.weight";
+    size_t nsz;
+    const void *norm_bf16 = model_get_weight(ctx->model, norm_name, &nsz);
+    if (norm_bf16) {
+        int H = cfg->hidden_size;
+        float *norm_w = malloc((size_t)H * sizeof(float));
+        bf16_to_float_vec(norm_w, norm_bf16, H);
+        float *tmp = malloc((size_t)H * sizeof(float));
+        cpu_rmsnorm(tmp, ctx->scratch.hidden, norm_w, H, cfg->rms_norm_eps);
+        memcpy(ctx->scratch.hidden, tmp, (size_t)H * sizeof(float));
+        free(tmp);
+        free(norm_w);
+    }
+
+    // lm_head has "language_model." prefix in the weight index
     q4_matmul(ctx, ctx->scratch.logits, ctx->scratch.hidden,
-              "lm_head.weight", "lm_head.scales", "lm_head.biases",
+              "language_model.lm_head.weight",
+              "language_model.lm_head.scales",
+              "language_model.lm_head.biases",
               cfg->vocab_size, cfg->hidden_size, 64);
 }
 
