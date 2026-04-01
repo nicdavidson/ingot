@@ -382,13 +382,6 @@ static void bf16_to_float_vec(float *out, const void *bf16_data, int n) {
 
 // --- Forward pass ---
 
-// Debug: compute L2 norm of a float vector
-static float debug_l2norm(const float *x, int n) {
-    double sum = 0.0;
-    for (int i = 0; i < n; i++) sum += (double)x[i] * (double)x[i];
-    return (float)sqrt(sum);
-}
-
 static void forward_layer(InferenceContext *ctx, int layer_idx) {
     const ModelConfig *cfg = model_config(ctx->model);
     ScratchBuffers *s = &ctx->scratch;
@@ -439,17 +432,6 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     // Add attention output to residual
     for (int i = 0; i < H; i++) {
         s->hidden[i] = s->residual[i] + attn_result[i];
-    }
-
-    // Debug: track hidden state norms to find corruption
-    if (ctx->position == 0 && (layer_idx < 3 || layer_idx >= 20 ||
-                                layer_idx == cfg->num_hidden_layers - 1)) {
-        const char *ltype = (cfg->layer_types && cfg->layer_types[layer_idx] == LAYER_FULL_ATTENTION)
-                            ? "SWA" : "DN";
-        LOG_INFO("debug L%d(%s) post-attn: hidden_norm=%.4f attn_norm=%.4f",
-                 layer_idx, ltype,
-                 debug_l2norm(s->hidden, H),
-                 debug_l2norm(attn_result, H));
     }
 
     // 10. Post-attention layernorm
@@ -549,9 +531,8 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     bool shared_on_gpu = false;
 
 #ifdef PLATFORM_MACOS
-    if (ctx->use_gpu && moe_dim <= 512) {
+    if (ctx->use_gpu) {
         // GPU path: fused gate+up+SwiGLU + batched down_proj (1 commit total)
-        // NOTE: temporarily disabled for moe_dim>512 to isolate 397B shared expert bug
         char gw[128], gs_n[128], gb_n[128], uw[128], us_n[128], ub_n[128];
         char dw[128], ds_n[128], db_n[128];
         snprintf(gw, sizeof(gw), "layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
@@ -626,14 +607,6 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     // Add gated shared expert output to residual
     for (int i = 0; i < H; i++) s->hidden[i] = s->residual[i] + shared_gate_val * s->expert_out[i];
 
-    // Debug: track shared expert contribution
-    if (ctx->position == 0 && (layer_idx <= 3 || (layer_idx >= 20 && layer_idx <= 25))) {
-        LOG_INFO("debug L%d shared_expert: gate=%.4f out_norm=%.4f hidden_norm=%.4f",
-                 layer_idx, shared_gate_val,
-                 debug_l2norm(s->expert_out, H),
-                 debug_l2norm(s->hidden, H));
-    }
-
     // 14. Routed experts
     moe_dim = cfg->moe_intermediate_size;
     if (moe_dim != cfg->shared_expert_intermediate_size) {
@@ -695,15 +668,11 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
             batch_count++;
         }
 
-        // Synchronous: wait for GPU work and accumulate immediately
-        kernel_end_batch(batch);
+        ctx->prev_expert_signal = kernel_end_batch_deferred(batch);
         for (int k = 0; k < batch_count; k++) {
-            float weight = top_weights[k];
-            float *result = ctx->cpu_result_slots[k];
-            for (int i = 0; i < H; i++) {
-                s->hidden[i] += weight * result[i];
-            }
+            ctx->prev_expert_weights[k] = top_weights[k];
         }
+        ctx->prev_expert_count = batch_count;
     } else if (ctx->use_gpu && K_active <= ctx->num_expert_slots) {
         // mmap-based GPU path (fallback when pread not available)
         void *expert_buf = model_get_expert_metal_buf(ctx->model, layer_idx);
@@ -744,14 +713,11 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
                 batch_count++;
             }
 
-            kernel_end_batch(batch);
+            ctx->prev_expert_signal = kernel_end_batch_deferred(batch);
             for (int k = 0; k < batch_count; k++) {
-                float weight = top_weights[k];
-                float *result = ctx->cpu_result_slots[k];
-                for (int i = 0; i < H; i++) {
-                    s->hidden[i] += weight * result[i];
-                }
+                ctx->prev_expert_weights[k] = top_weights[k];
             }
+            ctx->prev_expert_count = batch_count;
         }
     } else
 #endif
@@ -792,13 +758,6 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
                 s->hidden[i] += weight * expert_result[i];
             }
         }
-    }
-
-    // Debug: track hidden state norms after MoE
-    if (ctx->position == 0 && (layer_idx < 3 || layer_idx >= 20 ||
-                                layer_idx == cfg->num_hidden_layers - 1)) {
-        LOG_INFO("debug L%d post-moe: hidden_norm=%.4f", layer_idx,
-                 debug_l2norm(s->hidden, H));
     }
 
     // Cross-layer prefetch: hint next layer's shared weights while results
