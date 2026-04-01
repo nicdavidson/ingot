@@ -14,11 +14,15 @@ extern const char *shader_elementwise_src;
 extern const char *shader_attention_src;
 extern const char *shader_moe_gate_src;
 extern const char *shader_deltanet_src;
+extern const char *shader_fused_gate_up_swiglu_src;
+extern const char *shader_moe_combine_residual_src;
 
 // Pipeline indices
 enum {
     PIPE_MATMUL_F16,
     PIPE_MATMUL_Q4,
+    PIPE_MATMUL_Q4_FMA,
+    PIPE_MATMUL_BF16,
     PIPE_RMSNORM,
     PIPE_ROPE,
     PIPE_SOFTMAX,
@@ -31,6 +35,8 @@ enum {
     PIPE_ATTENTION_VALUES,
     PIPE_MOE_GATE_TOPK,
     PIPE_MOE_COMBINE,
+    PIPE_MOE_COMBINE_RESIDUAL,
+    PIPE_FUSED_GATE_UP_SWIGLU,
     PIPE_DELTANET_RECURRENT,
     PIPE_DELTANET_GATE,
     PIPE_COUNT,
@@ -107,8 +113,8 @@ MetalContext *metal_init(void) {
         const char *func_name;
         int         pipe_idx;
     } shaders[] = {
-        { shader_matmul_src,      "matmul_f16",          PIPE_MATMUL_F16 },
-        { shader_matmul_src,      "matmul_q4",           PIPE_MATMUL_Q4 },
+        { shader_matmul_src,      "matmul_q4_fma",       PIPE_MATMUL_Q4_FMA },
+        { shader_matmul_src,      "matmul_bf16",         PIPE_MATMUL_BF16 },
         { shader_rmsnorm_src,     "rmsnorm",             PIPE_RMSNORM },
         { shader_rope_src,        "rope_apply",          PIPE_ROPE },
         { shader_softmax_src,     "softmax",             PIPE_SOFTMAX },
@@ -121,6 +127,8 @@ MetalContext *metal_init(void) {
         { shader_attention_src,   "attention_values",    PIPE_ATTENTION_VALUES },
         { shader_moe_gate_src,    "moe_gate_topk",       PIPE_MOE_GATE_TOPK },
         { shader_moe_gate_src,    "moe_combine",         PIPE_MOE_COMBINE },
+        { shader_moe_combine_residual_src, "moe_combine_residual", PIPE_MOE_COMBINE_RESIDUAL },
+        { shader_fused_gate_up_swiglu_src, "fused_gate_up_swiglu", PIPE_FUSED_GATE_UP_SWIGLU },
         { shader_deltanet_src,    "deltanet_recurrent",  PIPE_DELTANET_RECURRENT },
         { shader_deltanet_src,    "deltanet_gate",       PIPE_DELTANET_GATE },
     };

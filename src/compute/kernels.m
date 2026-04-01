@@ -8,6 +8,8 @@
 enum {
     PIPE_MATMUL_F16,
     PIPE_MATMUL_Q4,
+    PIPE_MATMUL_Q4_FMA,
+    PIPE_MATMUL_BF16,
     PIPE_RMSNORM,
     PIPE_ROPE,
     PIPE_SOFTMAX,
@@ -20,6 +22,8 @@ enum {
     PIPE_ATTENTION_VALUES,
     PIPE_MOE_GATE_TOPK,
     PIPE_MOE_COMBINE,
+    PIPE_MOE_COMBINE_RESIDUAL,
+    PIPE_FUSED_GATE_UP_SWIGLU,
     PIPE_DELTANET_RECURRENT,
     PIPE_DELTANET_GATE,
     PIPE_COUNT,
@@ -97,17 +101,136 @@ static void dispatch_1d_with_floats(MetalContext *ctx, int pipe_idx,
 void kernel_matmul_f16(MetalContext *ctx,
                        void *A, void *x, void *out,
                        uint32_t M, uint32_t K) {
-    void *bufs[] = { A, x, out };
-    uint32_t params[] = { M, K };
-    dispatch_1d(ctx, PIPE_MATMUL_F16, bufs, params, 3, 2, M);
+    // Use BF16 kernel with threadgroup dispatch
+    kernel_matmul_bf16(ctx, A, x, out, M, K);
 }
 
 void kernel_matmul_q4(MetalContext *ctx,
                       void *A, void *x, void *out,
                       uint32_t M, uint32_t K) {
-    void *bufs[] = { A, x, out };
-    uint32_t params[] = { M, K };
-    dispatch_1d(ctx, PIPE_MATMUL_Q4, bufs, params, 3, 2, M);
+    // Redirect to FMA kernel with default group_size=64
+    kernel_matmul_q4_fma(ctx, A, NULL, NULL, x, out, M, K, 64);
+}
+
+// Optimized Q4 matmul: 256-thread threadgroups, shared memory, FMA dequant
+void kernel_matmul_q4_fma(MetalContext *ctx,
+                          void *weights, void *scales, void *biases,
+                          void *x, void *out,
+                          uint32_t M, uint32_t K, uint32_t group_size) {
+    id<MTLComputePipelineState> pipeline = ctx->pipelines[PIPE_MATMUL_Q4_FMA];
+    if (!pipeline) return;
+
+    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pipeline];
+
+    [enc setBuffer:(__bridge id<MTLBuffer>)weights offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)scales  offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)biases  offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)x       offset:0 atIndex:3];
+    [enc setBuffer:(__bridge id<MTLBuffer>)out     offset:0 atIndex:4];
+    [enc setBytes:&M          length:sizeof(M)          atIndex:5];
+    [enc setBytes:&K          length:sizeof(K)          atIndex:6];
+    [enc setBytes:&group_size length:sizeof(group_size) atIndex:7];
+
+    // One threadgroup per output row, 256 threads each
+    [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+}
+
+// BF16 matmul: 256-thread threadgroups, shared memory
+void kernel_matmul_bf16(MetalContext *ctx,
+                        void *A, void *x, void *out,
+                        uint32_t M, uint32_t K) {
+    id<MTLComputePipelineState> pipeline = ctx->pipelines[PIPE_MATMUL_BF16];
+    if (!pipeline) return;
+
+    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pipeline];
+
+    [enc setBuffer:(__bridge id<MTLBuffer>)A   offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)x   offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:2];
+    [enc setBytes:&M length:sizeof(M) atIndex:3];
+    [enc setBytes:&K length:sizeof(K) atIndex:4];
+
+    [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+}
+
+// Fused gate+up+SwiGLU: single kernel for MoE expert FFN first half
+void kernel_fused_gate_up_swiglu(MetalContext *ctx,
+                                  void *gate_w, void *gate_s, void *gate_b,
+                                  void *up_w, void *up_s, void *up_b,
+                                  void *x, void *out,
+                                  uint32_t moe_dim, uint32_t K,
+                                  uint32_t group_size) {
+    id<MTLComputePipelineState> pipeline = ctx->pipelines[PIPE_FUSED_GATE_UP_SWIGLU];
+    if (!pipeline) return;
+
+    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pipeline];
+
+    [enc setBuffer:(__bridge id<MTLBuffer>)gate_w offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)gate_s offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)gate_b offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)up_w   offset:0 atIndex:3];
+    [enc setBuffer:(__bridge id<MTLBuffer>)up_s   offset:0 atIndex:4];
+    [enc setBuffer:(__bridge id<MTLBuffer>)up_b   offset:0 atIndex:5];
+    [enc setBuffer:(__bridge id<MTLBuffer>)x      offset:0 atIndex:6];
+    [enc setBuffer:(__bridge id<MTLBuffer>)out    offset:0 atIndex:7];
+    [enc setBytes:&moe_dim    length:sizeof(moe_dim)    atIndex:8];
+    [enc setBytes:&K          length:sizeof(K)          atIndex:9];
+    [enc setBytes:&group_size length:sizeof(group_size) atIndex:10];
+
+    [enc dispatchThreadgroups:MTLSizeMake(moe_dim, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+}
+
+// Fused MoE combine + shared expert + residual
+void kernel_moe_combine_residual(MetalContext *ctx,
+                                  void *residual, void *shared_expert,
+                                  void *expert_outs, void *expert_weights,
+                                  void *out,
+                                  float shared_gate,
+                                  uint32_t K, uint32_t hidden_dim) {
+    id<MTLComputePipelineState> pipeline = ctx->pipelines[PIPE_MOE_COMBINE_RESIDUAL];
+    if (!pipeline) return;
+
+    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pipeline];
+
+    [enc setBuffer:(__bridge id<MTLBuffer>)residual       offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)shared_expert  offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)expert_outs    offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)expert_weights offset:0 atIndex:3];
+    [enc setBuffer:(__bridge id<MTLBuffer>)out            offset:0 atIndex:4];
+    [enc setBytes:&shared_gate length:sizeof(shared_gate) atIndex:5];
+    [enc setBytes:&K           length:sizeof(K)           atIndex:6];
+    [enc setBytes:&hidden_dim  length:sizeof(hidden_dim)  atIndex:7];
+
+    NSUInteger tg_size = MIN(pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)hidden_dim);
+    [enc dispatchThreads:MTLSizeMake(hidden_dim, 1, 1)
+   threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
 }
 
 void kernel_rmsnorm(MetalContext *ctx,
