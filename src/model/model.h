@@ -27,6 +27,20 @@ const Tokenizer *model_tokenizer(const Model *model);
 // The name should match the weight_index.json key (e.g., "layers.0.input_layernorm.weight").
 const void *model_get_weight(const Model *model, const char *name, size_t *out_size);
 
+// Get the byte offset of a weight within model_weights.bin (for Metal buffer offsets).
+// Returns -1 if not found.
+long model_get_weight_offset(const Model *model, const char *name);
+
+#ifdef PLATFORM_MACOS
+#include "compute/metal_context.h"
+
+// Get Metal context for GPU dispatch.
+MetalContext *model_get_metal(const Model *model);
+
+// Get Metal buffer wrapping shared weights (zero-copy).
+void *model_get_metal_shared_buf(const Model *model);
+#endif
+
 // Get a pointer to expert weight data for a specific expert in a layer.
 // Returns pointer into mmap'd expert file, or NULL if not found.
 const void *model_get_expert(const Model *model, int layer_idx, int expert_idx,

@@ -181,6 +181,12 @@ void metal_free_buffer(void *buffer) {
     (void)(__bridge_transfer id<MTLBuffer>)buffer; // ARC releases
 }
 
+void *metal_buffer_contents(void *buffer) {
+    if (!buffer) return NULL;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer;
+    return [buf contents];
+}
+
 void metal_sync(MetalContext *ctx) {
     id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
     [cb commit];

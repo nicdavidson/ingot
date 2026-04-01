@@ -10,6 +10,11 @@
 #include "util/timer.h"
 #include "util/arena.h"
 
+#ifdef PLATFORM_MACOS
+#include "compute/kernels.h"
+#include "compute/metal_context.h"
+#endif
+
 #include <alloca.h>
 #include <math.h>
 #include <stdlib.h>
@@ -40,6 +45,17 @@ struct InferenceContext {
     int             position;  // current token position
     int             kv_idx;    // current KV layer index (for SWA layers)
     int             dn_idx;    // current DeltaNet layer index
+
+#ifdef PLATFORM_MACOS
+    // GPU scratch buffers (Metal handles — CPU-accessible via unified memory)
+    MetalContext   *metal;
+    void           *shared_buf;    // Metal buffer wrapping all shared weights
+    void           *gpu_hidden;    // Metal buffer for hidden state
+    void           *gpu_norm_out;  // Metal buffer for norm output
+    void           *gpu_out;       // Metal buffer for matmul output (reusable)
+    void           *gpu_logits;    // Metal buffer for logits
+    bool            use_gpu;
+#endif
 };
 
 static void alloc_scratch(ScratchBuffers *s, const ModelConfig *cfg, int max_seq) {
@@ -88,6 +104,31 @@ InferenceContext *inference_create(Model *model) {
     ctx->cache = cache_create(cfg, max_seq);
     alloc_scratch(&ctx->scratch, cfg, max_seq);
     ctx->arena = arena_create(64 * 1024 * 1024); // 64 MB scratch arena
+
+#ifdef PLATFORM_MACOS
+    ctx->metal = model_get_metal(model);
+    ctx->shared_buf = model_get_metal_shared_buf(model);
+    if (ctx->metal && ctx->shared_buf) {
+        int H = cfg->hidden_size;
+        int max_out = cfg->vocab_size > H ? cfg->vocab_size : H;
+        ctx->gpu_hidden   = metal_alloc_buffer(ctx->metal, (size_t)H * sizeof(float));
+        ctx->gpu_norm_out  = metal_alloc_buffer(ctx->metal, (size_t)H * sizeof(float));
+        ctx->gpu_out       = metal_alloc_buffer(ctx->metal, (size_t)max_out * sizeof(float));
+        ctx->gpu_logits    = metal_alloc_buffer(ctx->metal, (size_t)cfg->vocab_size * sizeof(float));
+
+        if (ctx->gpu_hidden && ctx->gpu_norm_out && ctx->gpu_out && ctx->gpu_logits) {
+            // Point scratch arrays at the GPU buffer contents (unified memory)
+            free(ctx->scratch.hidden);
+            free(ctx->scratch.norm_out);
+            free(ctx->scratch.logits);
+            ctx->scratch.hidden   = metal_buffer_contents(ctx->gpu_hidden);
+            ctx->scratch.norm_out = metal_buffer_contents(ctx->gpu_norm_out);
+            ctx->scratch.logits   = metal_buffer_contents(ctx->gpu_logits);
+            ctx->use_gpu = true;
+            LOG_INFO("inference: GPU acceleration enabled");
+        }
+    }
+#endif
 
     LOG_INFO("inference: context created (max_seq=%d)", max_seq);
     return ctx;
@@ -174,16 +215,46 @@ static void cpu_attention(float *out, const float *q, const float *k_cache,
 }
 
 // Helper: quantized matmul using weight name lookup
+// Uses GPU when available, falls back to CPU.
 static void q4_matmul(InferenceContext *ctx, float *out, const float *x,
                       const char *w_name, const char *s_name, const char *b_name,
                       int M, int K, int group_size) {
+#ifdef PLATFORM_MACOS
+    if (ctx->use_gpu) {
+        long w_off = model_get_weight_offset(ctx->model, w_name);
+        long s_off = model_get_weight_offset(ctx->model, s_name);
+        long b_off = model_get_weight_offset(ctx->model, b_name);
+
+        if (w_off >= 0 && s_off >= 0 && b_off >= 0) {
+            // Determine which GPU buffer the input x lives in
+            void *x_buf = NULL;
+            if (x == ctx->scratch.hidden)   x_buf = ctx->gpu_hidden;
+            if (x == ctx->scratch.norm_out) x_buf = ctx->gpu_norm_out;
+
+            // Determine which GPU buffer the output goes to
+            void *out_buf = NULL;
+            if (out == ctx->scratch.hidden)   out_buf = ctx->gpu_hidden;
+            if (out == ctx->scratch.norm_out) out_buf = ctx->gpu_norm_out;
+            if (out == ctx->scratch.logits)   out_buf = ctx->gpu_logits;
+
+            if (x_buf && out_buf) {
+                kernel_matmul_q4_fma_offsets(ctx->metal, ctx->shared_buf,
+                                             (size_t)w_off, (size_t)s_off, (size_t)b_off,
+                                             x_buf, out_buf,
+                                             (uint32_t)M, (uint32_t)K, (uint32_t)group_size);
+                return;
+            }
+            // Fallthrough to CPU if buffers don't match
+        }
+    }
+#endif
+
     size_t ws, ss, bs;
     const void *w = model_get_weight(ctx->model, w_name, &ws);
     const void *s = model_get_weight(ctx->model, s_name, &ss);
     const void *b = model_get_weight(ctx->model, b_name, &bs);
 
     if (!w || !s || !b) {
-        // Weight not found — zero output
         memset(out, 0, (size_t)M * sizeof(float));
         return;
     }
@@ -529,6 +600,20 @@ int inference_generate(InferenceContext *ctx,
 void inference_free(InferenceContext *ctx) {
     if (!ctx) return;
     cache_free(ctx->cache);
+
+#ifdef PLATFORM_MACOS
+    if (ctx->use_gpu) {
+        // These were allocated by Metal, not malloc — null them before free_scratch
+        ctx->scratch.hidden = NULL;
+        ctx->scratch.norm_out = NULL;
+        ctx->scratch.logits = NULL;
+        metal_free_buffer(ctx->gpu_hidden);
+        metal_free_buffer(ctx->gpu_norm_out);
+        metal_free_buffer(ctx->gpu_out);
+        metal_free_buffer(ctx->gpu_logits);
+    }
+#endif
+
     free_scratch(&ctx->scratch);
     arena_destroy(&ctx->arena);
     free(ctx);

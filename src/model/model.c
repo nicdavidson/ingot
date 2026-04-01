@@ -206,6 +206,22 @@ const void *model_get_weight(const Model *model, const char *name, size_t *out_s
     return (const char *)model->shared_weights + e->offset;
 }
 
+long model_get_weight_offset(const Model *model, const char *name) {
+    const WeightEntry *e = weight_index_find(&model->weight_idx, name);
+    if (!e) return -1;
+    return (long)e->offset;
+}
+
+#ifdef PLATFORM_MACOS
+MetalContext *model_get_metal(const Model *model) {
+    return model->metal_ctx;
+}
+
+void *model_get_metal_shared_buf(const Model *model) {
+    return model->shared_mtl_buf;
+}
+#endif
+
 const void *model_get_expert(const Model *model, int layer_idx, int expert_idx,
                              size_t *out_stride) {
     // Find the expert index entry

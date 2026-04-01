@@ -26,6 +26,9 @@ void *metal_alloc_buffer(MetalContext *ctx, size_t size);
 // Free a Metal buffer.
 void metal_free_buffer(void *buffer);
 
+// Get CPU-accessible pointer to buffer contents (unified memory).
+void *metal_buffer_contents(void *buffer);
+
 // Synchronize — wait for all enqueued GPU work to complete.
 void metal_sync(MetalContext *ctx);
 
