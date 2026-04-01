@@ -579,8 +579,9 @@ int inference_generate(InferenceContext *ctx,
             callback(next_token, text, userdata);
         }
 
-        // Stop on EOS
-        if (next_token == tokenizer_eos_id(tok)) {
+        // Stop on EOS or im_end
+        if (next_token == tokenizer_eos_id(tok) ||
+            next_token == tokenizer_im_end_id(tok)) {
             LOG_INFO("inference: EOS at token %d", generated);
             break;
         }
