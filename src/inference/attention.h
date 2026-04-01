@@ -5,31 +5,38 @@
 #include "inference/kv_cache.h"
 #include "model/model.h"
 
+// Opaque GPU scratch for attention projections (allocated once, reused)
+typedef struct AttentionGPU AttentionGPU;
+
+// Allocate/free persistent GPU buffers for attention.
+// gpu may be NULL on non-macOS or if Metal is unavailable.
+AttentionGPU *attention_gpu_create(const Model *model, const ModelConfig *cfg);
+void attention_gpu_free(AttentionGPU *gpu);
+
 // Full (SWA) attention forward pass for a single layer.
-// Reads Q/K/V projection weights, applies RoPE, caches KV,
-// computes attention, and writes attn_out.
 void attention_swa_forward(
     float       *attn_out,     // [num_heads * head_dim] output
     const float *hidden,       // [hidden_size] input
     const Model *model,
     const ModelConfig *cfg,
     InferenceCache *cache,
-    int          layer_idx,    // global layer index
-    int          kv_layer_idx, // index into KV cache (SWA layers only)
-    int          position      // token position
+    AttentionGPU *gpu,         // reusable GPU buffers (may be NULL)
+    int          layer_idx,
+    int          kv_layer_idx,
+    int          position
 );
 
 // DeltaNet (linear attention / Mamba-style) forward pass.
-// Uses recurrent state instead of KV cache.
 void attention_deltanet_forward(
     float       *attn_out,     // [hidden_size] output
     const float *hidden,       // [hidden_size] input
     const Model *model,
     const ModelConfig *cfg,
     InferenceCache *cache,
-    int          layer_idx,    // global layer index
-    int          dn_layer_idx, // index into DeltaNet state
-    int          position      // token position
+    AttentionGPU *gpu,         // reusable GPU buffers (may be NULL)
+    int          layer_idx,
+    int          dn_layer_idx,
+    int          position
 );
 
 #endif

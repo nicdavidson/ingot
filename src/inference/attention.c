@@ -14,41 +14,106 @@
 #include <stdlib.h>
 #include <string.h>
 
+// --- GPU scratch for attention projections ---
+
+struct AttentionGPU {
+#ifdef PLATFORM_MACOS
+    MetalContext *metal;
+    void *shared_buf;       // Model's shared weight Metal buffer
+    void *gpu_x;            // Reusable input buffer [hidden_size]
+    void *gpu_out;          // Reusable output buffer [max_proj_dim]
+    float *cpu_x;           // CPU pointer into gpu_x (unified memory)
+    float *cpu_out;         // CPU pointer into gpu_out (unified memory)
+    int max_x_size;         // Size of gpu_x in floats
+    int max_out_size;       // Size of gpu_out in floats
+#endif
+    int dummy;              // Keep struct non-empty on non-macOS
+};
+
+AttentionGPU *attention_gpu_create(const Model *model, const ModelConfig *cfg) {
+    AttentionGPU *gpu = calloc(1, sizeof(AttentionGPU));
+    if (!gpu) return NULL;
+
+#ifdef PLATFORM_MACOS
+    gpu->metal = model_get_metal(model);
+    gpu->shared_buf = model_get_metal_shared_buf(model);
+    if (!gpu->metal || !gpu->shared_buf) return gpu;
+
+    int H = cfg->hidden_size;
+
+    // Compute max output dimension across all projection types:
+    // SWA: q_proj_dim (may be 2x q_dim if gated), kv_dim, H
+    // DeltaNet: conv_dim (key_dim*2+value_dim), z_dim, H, num_v_heads
+    int q_dim = cfg->num_attention_heads * cfg->head_dim;
+    int q_proj_dim = cfg->attn_output_gate ? q_dim * 2 : q_dim;
+    int kv_dim = cfg->num_key_value_heads * cfg->head_dim;
+
+    int key_dim = cfg->linear_attn.linear_num_key_heads *
+                  cfg->linear_attn.linear_key_head_dim;
+    int value_dim = cfg->linear_attn.linear_num_value_heads *
+                    cfg->linear_attn.linear_value_head_dim;
+    int conv_dim = key_dim * 2 + value_dim;
+    int z_dim = cfg->linear_attn.linear_num_value_heads *
+                cfg->linear_attn.linear_value_head_dim;
+
+    int max_out = q_proj_dim;
+    if (kv_dim > max_out) max_out = kv_dim;
+    if (conv_dim > max_out) max_out = conv_dim;
+    if (z_dim > max_out) max_out = z_dim;
+    if (H > max_out) max_out = H;
+
+    gpu->gpu_x = metal_alloc_buffer(gpu->metal, (size_t)H * sizeof(float));
+    gpu->gpu_out = metal_alloc_buffer(gpu->metal, (size_t)max_out * sizeof(float));
+
+    if (gpu->gpu_x && gpu->gpu_out) {
+        gpu->cpu_x = metal_buffer_contents(gpu->gpu_x);
+        gpu->cpu_out = metal_buffer_contents(gpu->gpu_out);
+        gpu->max_x_size = H;
+        gpu->max_out_size = max_out;
+        LOG_INFO("attention: GPU buffers allocated (x=%d, out=%d)", H, max_out);
+    } else {
+        if (gpu->gpu_x) metal_free_buffer(gpu->gpu_x);
+        if (gpu->gpu_out) metal_free_buffer(gpu->gpu_out);
+        gpu->gpu_x = NULL;
+        gpu->gpu_out = NULL;
+    }
+#endif
+
+    return gpu;
+}
+
+void attention_gpu_free(AttentionGPU *gpu) {
+    if (!gpu) return;
+#ifdef PLATFORM_MACOS
+    if (gpu->gpu_x) metal_free_buffer(gpu->gpu_x);
+    if (gpu->gpu_out) metal_free_buffer(gpu->gpu_out);
+#endif
+    free(gpu);
+}
+
 // --- Helpers ---
 
 static void q4_proj(float *out, const float *x, const Model *model,
-                    const char *base, int M, int K) {
+                    AttentionGPU *gpu, const char *base, int M, int K) {
     char wn[128], sn[128], bn[128];
     snprintf(wn, sizeof(wn), "%s.weight", base);
     snprintf(sn, sizeof(sn), "%s.scales", base);
     snprintf(bn, sizeof(bn), "%s.biases", base);
 
 #ifdef PLATFORM_MACOS
-    // GPU dispatch via temporary Metal buffers.
-    // We allocate temp GPU buffers because the input may already live inside
-    // another Metal buffer (unified memory), so newBufferWithBytesNoCopy fails.
-    MetalContext *metal = model_get_metal(model);
-    void *shared_buf = model_get_metal_shared_buf(model);
-    if (metal && shared_buf) {
+    if (gpu && gpu->gpu_x && gpu->gpu_out && K <= gpu->max_x_size &&
+        M <= gpu->max_out_size) {
         long w_off = model_get_weight_offset(model, wn);
         long s_off = model_get_weight_offset(model, sn);
         long b_off = model_get_weight_offset(model, bn);
         if (w_off >= 0 && s_off >= 0 && b_off >= 0) {
-            void *x_gpu = metal_alloc_buffer(metal, (size_t)K * sizeof(float));
-            void *out_gpu = metal_alloc_buffer(metal, (size_t)M * sizeof(float));
-            if (x_gpu && out_gpu) {
-                memcpy(metal_buffer_contents(x_gpu), x, (size_t)K * sizeof(float));
-                kernel_matmul_q4_fma_offsets(metal, shared_buf,
-                                             (size_t)w_off, (size_t)s_off, (size_t)b_off,
-                                             x_gpu, out_gpu,
-                                             (uint32_t)M, (uint32_t)K, 64);
-                memcpy(out, metal_buffer_contents(out_gpu), (size_t)M * sizeof(float));
-                metal_free_buffer(x_gpu);
-                metal_free_buffer(out_gpu);
-                return;
-            }
-            if (x_gpu) metal_free_buffer(x_gpu);
-            if (out_gpu) metal_free_buffer(out_gpu);
+            memcpy(gpu->cpu_x, x, (size_t)K * sizeof(float));
+            kernel_matmul_q4_fma_offsets(gpu->metal, gpu->shared_buf,
+                                         (size_t)w_off, (size_t)s_off, (size_t)b_off,
+                                         gpu->gpu_x, gpu->gpu_out,
+                                         (uint32_t)M, (uint32_t)K, 64);
+            memcpy(out, gpu->cpu_out, (size_t)M * sizeof(float));
+            return;
         }
     }
 #endif
@@ -106,7 +171,8 @@ static void l2norm(float *x, int n) {
 void attention_swa_forward(
     float *attn_out, const float *hidden,
     const Model *model, const ModelConfig *cfg,
-    InferenceCache *cache, int layer_idx, int kv_layer_idx, int position)
+    InferenceCache *cache, AttentionGPU *gpu,
+    int layer_idx, int kv_layer_idx, int position)
 {
     int H = cfg->hidden_size;
     int num_heads = cfg->num_attention_heads;
@@ -128,11 +194,11 @@ void attention_swa_forward(
 
     // Q/K/V projections
     snprintf(base, sizeof(base), "layers.%d.self_attn.q_proj", layer_idx);
-    q4_proj(q_full, hidden, model, base, q_proj_dim, H);
+    q4_proj(q_full, hidden, model, gpu, base, q_proj_dim, H);
     snprintf(base, sizeof(base), "layers.%d.self_attn.k_proj", layer_idx);
-    q4_proj(k, hidden, model, base, kv_dim, H);
+    q4_proj(k, hidden, model, gpu, base, kv_dim, H);
     snprintf(base, sizeof(base), "layers.%d.self_attn.v_proj", layer_idx);
-    q4_proj(v, hidden, model, base, kv_dim, H);
+    q4_proj(v, hidden, model, gpu, base, kv_dim, H);
 
     // Split q_proj into query and gate
     // q_full is laid out as [num_heads, head_dim*2] when gated
@@ -245,7 +311,7 @@ void attention_swa_forward(
 
     // Output projection
     snprintf(base, sizeof(base), "layers.%d.self_attn.o_proj", layer_idx);
-    q4_proj(attn_out, head_out, model, base, H, q_dim);
+    q4_proj(attn_out, head_out, model, gpu, base, H, q_dim);
 
     free(q); free(k); free(v);
     free(q_norm_w); free(k_norm_w);
@@ -267,7 +333,8 @@ void attention_swa_forward(
 void attention_deltanet_forward(
     float *attn_out, const float *hidden,
     const Model *model, const ModelConfig *cfg,
-    InferenceCache *cache, int layer_idx, int dn_layer_idx, int position)
+    InferenceCache *cache, AttentionGPU *gpu,
+    int layer_idx, int dn_layer_idx, int position)
 {
     (void)position;
 
@@ -285,7 +352,7 @@ void attention_deltanet_forward(
     // 1. QKV projection: hidden → [key_dim + key_dim + value_dim]
     float *qkv = calloc((size_t)conv_dim, sizeof(float));
     snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_qkv", layer_idx);
-    q4_proj(qkv, hidden, model, base, conv_dim, H);
+    q4_proj(qkv, hidden, model, gpu, base, conv_dim, H);
 
     // 2. Causal conv1d with state tracking
     // Conv1d weight is [conv_dim, kernel_size, 1] BF16 (depthwise)
@@ -329,7 +396,7 @@ void attention_deltanet_forward(
     // beta = sigmoid(in_proj_b(hidden))
     float *b_raw = calloc((size_t)num_v_heads, sizeof(float));
     snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_b", layer_idx);
-    q4_proj(b_raw, hidden, model, base, num_v_heads, H);
+    q4_proj(b_raw, hidden, model, gpu, base, num_v_heads, H);
     float *beta = calloc((size_t)num_v_heads, sizeof(float));
     for (int i = 0; i < num_v_heads; i++) {
         beta[i] = 1.0f / (1.0f + expf(-b_raw[i])); // sigmoid
@@ -338,7 +405,7 @@ void attention_deltanet_forward(
     // g = -exp(A_log) * softplus(in_proj_a(hidden) + dt_bias)
     float *a_raw = calloc((size_t)num_v_heads, sizeof(float));
     snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_a", layer_idx);
-    q4_proj(a_raw, hidden, model, base, num_v_heads, H);
+    q4_proj(a_raw, hidden, model, gpu, base, num_v_heads, H);
 
     float *A_log = calloc((size_t)num_v_heads, sizeof(float));
     snprintf(wname, sizeof(wname), "layers.%d.linear_attn.A_log", layer_idx);
@@ -357,7 +424,7 @@ void attention_deltanet_forward(
     int z_dim = num_v_heads * head_v_dim;
     float *z = calloc((size_t)z_dim, sizeof(float));
     snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_z", layer_idx);
-    q4_proj(z, hidden, model, base, z_dim, H);
+    q4_proj(z, hidden, model, gpu, base, z_dim, H);
 
     // 6. L2 normalize Q and K per head
     // Note: use_qk_l2norm_in_kernel=True is the default for Qwen 3.5
@@ -506,7 +573,7 @@ void attention_deltanet_forward(
 
     // 10. Output projection
     snprintf(base, sizeof(base), "layers.%d.linear_attn.out_proj", layer_idx);
-    q4_proj(attn_out, core_out, model, base, H, value_dim);
+    q4_proj(attn_out, core_out, model, gpu, base, H, value_dim);
 
     free(qkv); free(b_raw); free(beta); free(a_raw);
     free(A_log); free(dt_bias_w); free(g); free(z);

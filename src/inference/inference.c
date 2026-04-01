@@ -45,6 +45,7 @@ struct InferenceContext {
     int             position;  // current token position
     int             kv_idx;    // current KV layer index (for SWA layers)
     int             dn_idx;    // current DeltaNet layer index
+    AttentionGPU   *attn_gpu;  // reusable GPU buffers for attention projections
 
 #ifdef PLATFORM_MACOS
     // GPU scratch buffers (Metal handles — CPU-accessible via unified memory)
@@ -113,6 +114,7 @@ InferenceContext *inference_create(Model *model) {
     ctx->cache = cache_create(cfg, max_seq);
     alloc_scratch(&ctx->scratch, cfg, max_seq);
     ctx->arena = arena_create(64 * 1024 * 1024); // 64 MB scratch arena
+    ctx->attn_gpu = attention_gpu_create(model, cfg);
 
 #ifdef PLATFORM_MACOS
     ctx->metal = model_get_metal(model);
@@ -319,11 +321,13 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
 
     if (cfg->layer_types && cfg->layer_types[layer_idx] == LAYER_FULL_ATTENTION) {
         attention_swa_forward(attn_result, s->norm_out, ctx->model, cfg,
-                             ctx->cache, layer_idx, ctx->kv_idx, ctx->position);
+                             ctx->cache, ctx->attn_gpu,
+                             layer_idx, ctx->kv_idx, ctx->position);
         ctx->kv_idx++;
     } else {
         attention_deltanet_forward(attn_result, s->norm_out, ctx->model, cfg,
-                                   ctx->cache, layer_idx, ctx->dn_idx, ctx->position);
+                                   ctx->cache, ctx->attn_gpu,
+                                   layer_idx, ctx->dn_idx, ctx->position);
         ctx->dn_idx++;
     }
 
@@ -663,6 +667,7 @@ int inference_generate(InferenceContext *ctx,
 
 void inference_free(InferenceContext *ctx) {
     if (!ctx) return;
+    attention_gpu_free(ctx->attn_gpu);
     cache_free(ctx->cache);
 
 #ifdef PLATFORM_MACOS
