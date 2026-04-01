@@ -549,8 +549,9 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     bool shared_on_gpu = false;
 
 #ifdef PLATFORM_MACOS
-    if (ctx->use_gpu) {
+    if (ctx->use_gpu && moe_dim <= 512) {
         // GPU path: fused gate+up+SwiGLU + batched down_proj (1 commit total)
+        // NOTE: temporarily disabled for moe_dim>512 to isolate 397B shared expert bug
         char gw[128], gs_n[128], gb_n[128], uw[128], us_n[128], ub_n[128];
         char dw[128], ds_n[128], db_n[128];
         snprintf(gw, sizeof(gw), "layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
