@@ -118,8 +118,9 @@ class WeightConverter:
                       "added_tokens.json", "tokenizer_config.json",
                       "generation_config.json"]:
             src = self.input_dir / fname
-            if src.exists():
-                shutil.copy2(src, self.output_dir / fname)
+            dst = self.output_dir / fname
+            if src.exists() and src.resolve() != dst.resolve():
+                shutil.copy2(src, dst)
                 print(f"  copied {fname}")
 
         # Classify weights
