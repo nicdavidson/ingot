@@ -31,3 +31,12 @@
 - **35B**: 14.3 tok/s (from 3.7 baseline — 3.9x improvement, target 13+ achieved!)
 - **397B**: 0.1 tok/s (up from 0.04 — 2.5x, memory-bound by SSD-backed mmap)
 - Key insight: dispatch overhead (commit+waitUntilCompleted) was ~50% of token time
+
+## Phase 5: Parallel pread expert I/O with Metal staging buffers
+- Change: Replace mmap page-fault I/O with parallel pread() via GCD dispatch groups
+- Expert data read directly into Metal unified memory staging buffers (zero-copy GPU access)
+- pread issued after gate top-K, overlaps with shared expert GPU work
+- Threshold: only use pread for large experts (>2MB stride) to avoid regressing small models
+- **35B**: 13.4 tok/s (no regression — uses mmap path for small 1MB experts)
+- **397B**: 2.7 tok/s cold, 5.6 tok/s warm (from 0.05 — **54-112x improvement**)
+- Key insight: parallel pread eliminates serial page faults, SSD serves 10 concurrent reads
