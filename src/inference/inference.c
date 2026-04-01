@@ -625,6 +625,14 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     // Add gated shared expert output to residual
     for (int i = 0; i < H; i++) s->hidden[i] = s->residual[i] + shared_gate_val * s->expert_out[i];
 
+    // Debug: track shared expert contribution
+    if (ctx->position == 0 && layer_idx >= 20 && layer_idx <= 25) {
+        LOG_INFO("debug L%d shared_expert: gate=%.4f out_norm=%.4f hidden_norm=%.4f",
+                 layer_idx, shared_gate_val,
+                 debug_l2norm(s->expert_out, H),
+                 debug_l2norm(s->hidden, H));
+    }
+
     // 14. Routed experts
     moe_dim = cfg->moe_intermediate_size;
     if (moe_dim != cfg->shared_expert_intermediate_size) {
