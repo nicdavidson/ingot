@@ -6,6 +6,7 @@
 #include "inference/sampler.h"
 #include "inference/dequant.h"
 #include "config/config.h"
+#include "model/mmap_pool.h"
 #include "util/log.h"
 #include "util/timer.h"
 #include "util/arena.h"
@@ -423,6 +424,17 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
         for (int k = 0; k < K_active; k++) top_weights[k] /= wsum;
     }
 
+    // Prefetch selected expert weight pages — gives the OS a head start
+    // paging in expert data while the shared expert FFN runs on GPU
+    for (int k = 0; k < K_active; k++) {
+        size_t stride;
+        const void *expert_data = model_get_expert(ctx->model, layer_idx,
+                                                    top_indices[k], &stride);
+        if (expert_data) {
+            mmap_pool_prefetch((void *)expert_data, stride);
+        }
+    }
+
     // 13. Shared expert FFN
     int moe_dim = cfg->shared_expert_intermediate_size;
     float *gate_out = arena_alloc(&ctx->arena, (size_t)moe_dim * sizeof(float));
@@ -619,6 +631,23 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
                 s->hidden[i] += weight * expert_result[i];
             }
         }
+    }
+
+    // Cross-layer prefetch: hint next layer's shared weights while results
+    // are being accumulated. Overlaps SSD reads with CPU work.
+    int next_layer = layer_idx + 1;
+    if (next_layer < cfg->num_hidden_layers) {
+        // Prefetch next layer's norm weights (will be needed first)
+        char pf_name[128];
+        size_t pf_size;
+        snprintf(pf_name, sizeof(pf_name), "layers.%d.input_layernorm.weight", next_layer);
+        const void *pf = model_get_weight(ctx->model, pf_name, &pf_size);
+        if (pf) mmap_pool_prefetch((void *)pf, pf_size);
+
+        // Prefetch next layer's shared expert gate_proj (largest shared weight)
+        snprintf(pf_name, sizeof(pf_name), "layers.%d.mlp.shared_expert.gate_proj.weight", next_layer);
+        pf = model_get_weight(ctx->model, pf_name, &pf_size);
+        if (pf) mmap_pool_prefetch((void *)pf, pf_size);
     }
 
     arena_reset(&ctx->arena);

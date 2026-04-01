@@ -61,8 +61,8 @@ void *mmap_pool_add(MmapPool *pool, const char *path, size_t *out_size) {
         return NULL;
     }
 
-    // Tell the OS not to prefetch sequentially — experts are accessed randomly
-    madvise(addr, size, MADV_RANDOM);
+    // Default readahead behavior — per-expert MADV_WILLNEED provides
+    // targeted prefetch hints when experts are selected by the gate
 
     MappedFile *mf = &pool->files[pool->count++];
     mf->addr = addr;
