@@ -498,23 +498,27 @@ int inference_generate(InferenceContext *ctx,
     LOG_INFO("inference: prefill done in %.1f ms",
              timer_elapsed_ms(t_start, t_prefill));
 
+    // Compute logits from the last prefill hidden state
+    compute_logits(ctx);
+
     // Generate tokens
-    int32_t next_token = prompt_tokens[num_prompt_tokens - 1];
+    int32_t next_token = -1;
 
     for (int t = 0; t < max_tokens; t++) {
-        ctx->position = num_prompt_tokens + t;
-        ctx->kv_idx = 0;
-        ctx->dn_idx = 0;
+        if (t > 0) {
+            // Run forward pass for each new token (skip first — already done in prefill)
+            ctx->position = num_prompt_tokens + t - 1;
+            ctx->kv_idx = 0;
+            ctx->dn_idx = 0;
 
-        embed_token(ctx, next_token);
+            embed_token(ctx, next_token);
 
-        // Forward pass through all layers
-        for (int l = 0; l < cfg->num_hidden_layers; l++) {
-            forward_layer(ctx, l);
+            for (int l = 0; l < cfg->num_hidden_layers; l++) {
+                forward_layer(ctx, l);
+            }
+
+            compute_logits(ctx);
         }
-
-        // Project to vocab logits
-        compute_logits(ctx);
 
         // Debug: dump logits stats for first generation step
         if (t == 0) {
