@@ -322,13 +322,14 @@ static bool load_added_tokens(Tokenizer *tok, const char *path) {
         return false;
     }
 
-    // Try "added_tokens_decoder" (tokenizer_config.json format),
-    // otherwise treat root object as the token map (added_tokens.json format)
+    // Try "added_tokens_decoder" (tokenizer_config.json format: {id: {content: "..."}}),
+    // otherwise treat root object as simple map (added_tokens.json format: {content: id})
     int atd_idx = json_get(&doc, 0, "added_tokens_decoder");
+    bool simple_format = false;
     if (atd_idx < 0) {
-        // Root object is the map
         if (doc.tokens[0].type == JSON_OBJECT) {
             atd_idx = 0;
+            simple_format = true;
         } else {
             free(tokens);
             free(json);
@@ -341,38 +342,48 @@ static bool load_added_tokens(Tokenizer *tok, const char *path) {
     for (int i = 0; i < doc.tokens[atd_idx].children; i++) {
         if (key_idx < 0 || key_idx >= doc.num_tokens) break;
 
-        // Key is the token ID as a string
-        char id_str[32];
-        json_string(&doc, key_idx, id_str, sizeof(id_str));
-        int id = atoi(id_str);
-
-        // Value is an object with "content" field
+        char key_str[256];
+        json_string(&doc, key_idx, key_str, sizeof(key_str));
         int val_idx = key_idx + 1;
-        int content_idx = json_get(&doc, val_idx, "content");
-        if (content_idx >= 0) {
-            char content[256];
-            json_string(&doc, content_idx, content, sizeof(content));
 
-            // Add to vocab if not already present
-            if (id >= 0 && hashmap_get(&tok->token_to_id, content, -1) < 0) {
-                // Extend id_to_token array if needed
-                if (id >= tok->vocab_size) {
-                    int new_size = id + 1;
-                    char **new_arr = realloc(tok->id_to_token,
-                                            (size_t)new_size * sizeof(char *));
-                    if (new_arr) {
-                        memset(new_arr + tok->vocab_size, 0,
-                               (size_t)(new_size - tok->vocab_size) * sizeof(char *));
-                        tok->id_to_token = new_arr;
-                        tok->vocab_size = new_size;
-                    }
+        int id = -1;
+        char content[256];
+        content[0] = '\0';
+
+        if (simple_format) {
+            // Simple format: {"<|endoftext|>": 248044, ...}
+            // Key is the content, value is the integer ID
+            strncpy(content, key_str, sizeof(content) - 1);
+            content[sizeof(content) - 1] = '\0';
+            id = json_int(&doc, val_idx);
+        } else {
+            // Decoder format: {"248044": {"content": "<|endoftext|>", ...}, ...}
+            id = atoi(key_str);
+            int content_idx = json_get(&doc, val_idx, "content");
+            if (content_idx >= 0) {
+                json_string(&doc, content_idx, content, sizeof(content));
+            }
+        }
+
+        if (id >= 0 && content[0] != '\0' &&
+            hashmap_get(&tok->token_to_id, content, -1) < 0) {
+            // Extend id_to_token array if needed
+            if (id >= tok->vocab_size) {
+                int new_size = id + 1;
+                char **new_arr = realloc(tok->id_to_token,
+                                        (size_t)new_size * sizeof(char *));
+                if (new_arr) {
+                    memset(new_arr + tok->vocab_size, 0,
+                           (size_t)(new_size - tok->vocab_size) * sizeof(char *));
+                    tok->id_to_token = new_arr;
+                    tok->vocab_size = new_size;
                 }
-                if (id < tok->vocab_size) {
-                    free(tok->id_to_token[id]);
-                    tok->id_to_token[id] = strdup(content);
-                    hashmap_put(&tok->token_to_id, content, id);
-                    added++;
-                }
+            }
+            if (id < tok->vocab_size) {
+                free(tok->id_to_token[id]);
+                tok->id_to_token[id] = strdup(content);
+                hashmap_put(&tok->token_to_id, content, id);
+                added++;
             }
         }
 
