@@ -6,6 +6,8 @@
 
 #ifdef PLATFORM_MACOS
 #include <Accelerate/Accelerate.h>
+#include "compute/kernels.h"
+#include "compute/metal_context.h"
 #endif
 
 #include <math.h>
@@ -20,6 +22,33 @@ static void q4_proj(float *out, const float *x, const Model *model,
     snprintf(wn, sizeof(wn), "%s.weight", base);
     snprintf(sn, sizeof(sn), "%s.scales", base);
     snprintf(bn, sizeof(bn), "%s.biases", base);
+
+#ifdef PLATFORM_MACOS
+    // Try GPU dispatch via shared Metal buffer
+    MetalContext *metal = model_get_metal(model);
+    void *shared_buf = model_get_metal_shared_buf(model);
+    if (metal && shared_buf) {
+        long w_off = model_get_weight_offset(model, wn);
+        long s_off = model_get_weight_offset(model, sn);
+        long b_off = model_get_weight_offset(model, bn);
+        if (w_off >= 0 && s_off >= 0 && b_off >= 0) {
+            // Wrap input and output as temporary Metal buffers
+            void *x_buf = metal_wrap_buffer(metal, (void *)x, (size_t)K * sizeof(float));
+            void *out_buf = metal_wrap_buffer(metal, out, (size_t)M * sizeof(float));
+            if (x_buf && out_buf) {
+                kernel_matmul_q4_fma_offsets(metal, shared_buf,
+                                             (size_t)w_off, (size_t)s_off, (size_t)b_off,
+                                             x_buf, out_buf,
+                                             (uint32_t)M, (uint32_t)K, 64);
+                metal_free_buffer(x_buf);
+                metal_free_buffer(out_buf);
+                return;
+            }
+            if (x_buf) metal_free_buffer(x_buf);
+            if (out_buf) metal_free_buffer(out_buf);
+        }
+    }
+#endif
 
     size_t ws, ss, bs;
     const void *w = model_get_weight(model, wn, &ws);
