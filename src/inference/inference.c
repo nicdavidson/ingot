@@ -456,11 +456,13 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
 
     // Issue parallel pread() for selected experts into staging buffers.
     // This runs concurrently with the shared expert FFN below.
+    // Only use pread for large experts (>2MB) where mmap page faults are costly.
+    // Small experts (35B: ~1MB) are fast via mmap since they fit in page cache.
     size_t expert_stride = model_get_expert_stride(ctx->model, layer_idx);
     int expert_fd = model_get_expert_fd(ctx->model, layer_idx);
 #ifdef PLATFORM_MACOS
     bool pread_experts = false;
-    if (ctx->expert_io && expert_fd >= 0 && expert_stride > 0 &&
+    if (ctx->expert_io && expert_fd >= 0 && expert_stride > (2 * 1024 * 1024) &&
         K_active <= ctx->num_expert_slots &&
         expert_stride <= ctx->expert_staging_size) {
         size_t offsets[16];
