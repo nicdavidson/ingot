@@ -49,7 +49,15 @@ static void q4_proj(float *out, const float *x, const Model *model,
             }
             if (x_gpu) metal_free_buffer(x_gpu);
             if (out_gpu) metal_free_buffer(out_gpu);
+            LOG_ERROR("attn q4_proj: GPU alloc failed for %s (M=%d K=%d)", base, M, K);
+        } else {
+            LOG_ERROR("attn q4_proj: weight offset missing for %s (w=%ld s=%ld b=%ld)",
+                      base, w_off, s_off, b_off);
         }
+    } else {
+        static int warn_count = 0;
+        if (warn_count++ < 3)
+            LOG_ERROR("attn q4_proj: no metal=%p shared_buf=%p", (void *)metal, shared_buf);
     }
 #endif
 
