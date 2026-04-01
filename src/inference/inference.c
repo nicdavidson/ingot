@@ -382,6 +382,13 @@ static void bf16_to_float_vec(float *out, const void *bf16_data, int n) {
 
 // --- Forward pass ---
 
+// Debug: compute L2 norm of a float vector
+static float debug_l2norm(const float *x, int n) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += (double)x[i] * (double)x[i];
+    return (float)sqrt(sum);
+}
+
 static void forward_layer(InferenceContext *ctx, int layer_idx) {
     const ModelConfig *cfg = model_config(ctx->model);
     ScratchBuffers *s = &ctx->scratch;
@@ -432,6 +439,17 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     // Add attention output to residual
     for (int i = 0; i < H; i++) {
         s->hidden[i] = s->residual[i] + attn_result[i];
+    }
+
+    // Debug: track hidden state norms to find corruption
+    if (ctx->position == 0 && (layer_idx < 3 || layer_idx % 10 == 0 ||
+                                layer_idx == cfg->num_hidden_layers - 1)) {
+        const char *ltype = (cfg->layer_types && cfg->layer_types[layer_idx] == LAYER_FULL_ATTENTION)
+                            ? "SWA" : "DN";
+        LOG_INFO("debug L%d(%s) post-attn: hidden_norm=%.4f attn_norm=%.4f",
+                 layer_idx, ltype,
+                 debug_l2norm(s->hidden, H),
+                 debug_l2norm(attn_result, H));
     }
 
     // 10. Post-attention layernorm
@@ -761,6 +779,13 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
                 s->hidden[i] += weight * expert_result[i];
             }
         }
+    }
+
+    // Debug: track hidden state norms after MoE
+    if (ctx->position == 0 && (layer_idx < 3 || layer_idx % 10 == 0 ||
+                                layer_idx == cfg->num_hidden_layers - 1)) {
+        LOG_INFO("debug L%d post-moe: hidden_norm=%.4f", layer_idx,
+                 debug_l2norm(s->hidden, H));
     }
 
     // Cross-layer prefetch: hint next layer's shared weights while results
