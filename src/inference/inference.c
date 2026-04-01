@@ -55,7 +55,7 @@ struct InferenceContext {
     void           *gpu_norm_out;  // Metal buffer for norm output
     void           *gpu_out;       // Metal buffer for matmul output (reusable)
     void           *gpu_logits;    // Metal buffer for logits
-    // Expert GPU scratch
+    // Expert GPU scratch (shared expert uses slot 0)
     void           *gpu_gate_out;  // Metal buffer for expert gate_proj output
     void           *gpu_up_out;    // Metal buffer for expert up_proj output
     void           *gpu_ffn_mid;   // Metal buffer for SiLU(gate)*up intermediate
@@ -64,6 +64,12 @@ struct InferenceContext {
     float          *cpu_up_out;
     float          *cpu_ffn_mid;
     float          *cpu_expert_result;
+    // Per-expert GPU buffers for batched dispatch (all experts in one commit)
+    int             num_expert_slots;
+    void           *gpu_ffn_mid_slots[16];
+    void           *gpu_result_slots[16];
+    float          *cpu_ffn_mid_slots[16];
+    float          *cpu_result_slots[16];
     bool            use_gpu;
 #endif
 };
@@ -150,7 +156,28 @@ InferenceContext *inference_create(Model *model) {
             ctx->cpu_ffn_mid       = metal_buffer_contents(ctx->gpu_ffn_mid);
             ctx->cpu_expert_result = metal_buffer_contents(ctx->gpu_expert_result);
             ctx->use_gpu = true;
-            LOG_INFO("inference: GPU acceleration enabled");
+
+            // Per-expert GPU buffers for batched dispatch
+            int K_max = cfg->num_experts_per_tok;
+            if (K_max > 16) K_max = 16;
+            bool slots_ok = true;
+            for (int i = 0; i < K_max; i++) {
+                ctx->gpu_ffn_mid_slots[i] = metal_alloc_buffer(ctx->metal,
+                    (size_t)expert_dim * sizeof(float));
+                ctx->gpu_result_slots[i] = metal_alloc_buffer(ctx->metal,
+                    (size_t)H * sizeof(float));
+                if (ctx->gpu_ffn_mid_slots[i] && ctx->gpu_result_slots[i]) {
+                    ctx->cpu_ffn_mid_slots[i] = metal_buffer_contents(ctx->gpu_ffn_mid_slots[i]);
+                    ctx->cpu_result_slots[i] = metal_buffer_contents(ctx->gpu_result_slots[i]);
+                } else {
+                    slots_ok = false;
+                    break;
+                }
+            }
+            if (slots_ok) {
+                ctx->num_expert_slots = K_max;
+            }
+            LOG_INFO("inference: GPU acceleration enabled (%d expert slots)", ctx->num_expert_slots);
         }
     }
 #endif
@@ -501,6 +528,60 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     size_t dw_size = (size_t)H * (size_t)(moe_dim / 8) * 4;
     size_t ds_size = (size_t)H * (size_t)down_groups * 2;
 
+#ifdef PLATFORM_MACOS
+    // Batched GPU path: encode ALL routed experts into one command buffer
+    void *expert_buf = model_get_expert_metal_buf(ctx->model, layer_idx);
+    if (ctx->use_gpu && expert_buf && K_active <= ctx->num_expert_slots) {
+        void *batch = kernel_begin_batch(ctx->metal);
+        int batch_count = 0;
+
+        for (int k = 0; k < K_active; k++) {
+            int expert_idx = top_indices[k];
+            size_t stride;
+            const void *expert_data = model_get_expert(ctx->model, layer_idx,
+                                                        expert_idx, &stride);
+            if (!expert_data) continue;
+
+            size_t base = (size_t)expert_idx * stride;
+            size_t down_base = base + proj_size * 2;
+
+            // Fused gate+up+SwiGLU → per-expert ffn_mid slot
+            kernel_batch_fused_gate_up_swiglu_offsets(batch, expert_buf,
+                                                      base,
+                                                      base + w_size,
+                                                      base + w_size + s_size,
+                                                      base + proj_size,
+                                                      base + proj_size + w_size,
+                                                      base + proj_size + w_size + s_size,
+                                                      ctx->gpu_norm_out,
+                                                      ctx->gpu_ffn_mid_slots[k],
+                                                      (uint32_t)moe_dim, (uint32_t)H,
+                                                      (uint32_t)group_size);
+
+            // down_proj → per-expert result slot
+            kernel_batch_q4_fma_offsets(batch, expert_buf,
+                                        down_base,
+                                        down_base + dw_size,
+                                        down_base + dw_size + ds_size,
+                                        ctx->gpu_ffn_mid_slots[k],
+                                        ctx->gpu_result_slots[k],
+                                        (uint32_t)H, (uint32_t)moe_dim,
+                                        (uint32_t)group_size);
+            batch_count++;
+        }
+
+        kernel_end_batch(batch);  // Single commit for ALL experts
+
+        // Accumulate weighted results from unified memory
+        for (int k = 0; k < batch_count; k++) {
+            float weight = top_weights[k];
+            float *result = ctx->cpu_result_slots[k];
+            for (int i = 0; i < H; i++) {
+                s->hidden[i] += weight * result[i];
+            }
+        }
+    } else
+#endif
     for (int k = 0; k < K_active; k++) {
         int expert_idx = top_indices[k];
         float weight = top_weights[k];
@@ -510,43 +591,6 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
                                                     expert_idx, &stride);
         if (!expert_data) continue;
 
-#ifdef PLATFORM_MACOS
-        void *expert_buf = model_get_expert_metal_buf(ctx->model, layer_idx);
-        if (ctx->use_gpu && expert_buf) {
-            size_t base = (size_t)expert_idx * stride;
-
-            // Batch fused gate+up+SwiGLU + down_proj into one command buffer
-            // (1 commit instead of 2, Metal respects encoder ordering)
-            size_t down_base = base + proj_size * 2;
-            void *batch = kernel_begin_batch(ctx->metal);
-
-            kernel_batch_fused_gate_up_swiglu_offsets(batch, expert_buf,
-                                                      base,
-                                                      base + w_size,
-                                                      base + w_size + s_size,
-                                                      base + proj_size,
-                                                      base + proj_size + w_size,
-                                                      base + proj_size + w_size + s_size,
-                                                      ctx->gpu_norm_out, ctx->gpu_ffn_mid,
-                                                      (uint32_t)moe_dim, (uint32_t)H,
-                                                      (uint32_t)group_size);
-
-            kernel_batch_q4_fma_offsets(batch, expert_buf,
-                                        down_base,
-                                        down_base + dw_size,
-                                        down_base + dw_size + ds_size,
-                                        ctx->gpu_ffn_mid, ctx->gpu_expert_result,
-                                        (uint32_t)H, (uint32_t)moe_dim,
-                                        (uint32_t)group_size);
-
-            kernel_end_batch(batch);
-
-            // Weighted add to hidden
-            for (int i = 0; i < H; i++) {
-                s->hidden[i] += weight * ctx->cpu_expert_result[i];
-            }
-        } else
-#endif
         {
             // CPU fallback
             const char *ptr = expert_data;
@@ -732,6 +776,10 @@ void inference_free(InferenceContext *ctx) {
         metal_free_buffer(ctx->gpu_up_out);
         metal_free_buffer(ctx->gpu_ffn_mid);
         metal_free_buffer(ctx->gpu_expert_result);
+        for (int i = 0; i < ctx->num_expert_slots; i++) {
+            metal_free_buffer(ctx->gpu_ffn_mid_slots[i]);
+            metal_free_buffer(ctx->gpu_result_slots[i]);
+        }
     }
 #endif
 
