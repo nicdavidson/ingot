@@ -239,6 +239,8 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     }
 
     // 10. Post-attention layernorm
+    // Save post-attention hidden as new residual for MLP block
+    memcpy(s->residual, s->hidden, (size_t)H * sizeof(float));
     snprintf(name, sizeof(name), "layers.%d.post_attention_layernorm.weight", layer_idx);
     const void *post_norm_bf16 = model_get_weight(ctx->model, name, &norm_size);
     if (post_norm_bf16) {
