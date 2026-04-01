@@ -13,7 +13,7 @@ ifeq ($(UNAME),Darwin)
   # macOS: full build with Metal + Foundation
   OBJCFLAGS := -fobjc-arc
   FRAMEWORKS := -framework Metal -framework Foundation -framework MetalKit -framework Accelerate
-  CFLAGS += -DPLATFORM_MACOS
+  CFLAGS += -DPLATFORM_MACOS -DACCELERATE_NEW_LAPACK
 
   # All source files (C + ObjC)
   C_SRCS  := $(shell find $(SRC_DIR) -name '*.c')
