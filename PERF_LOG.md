@@ -19,3 +19,15 @@
 - **35B**: 4.0 tok/s (up from 3.7 baseline — 8% improvement)
 - **397B**: 0.05 tok/s (marginal — bottleneck is memory paging, expert files ~180GB exceed RAM)
 - Note: 397B speed limited by SSD-backed mmap, not GPU dispatch overhead
+
+## Phase 3: Fused gate+up+SwiGLU in expert hot path
+- Change: Replace separate gate_proj + up_proj + cpu_silu_mul with fused_gate_up_swiglu_offsets kernel
+- **35B**: 3.9 tok/s (marginal gain — fused kernel vs batched pair comparable for small dims)
+
+## Phase 4: Batch GPU work aggressively
+- Change: Batch all routed experts into single command buffer (per-expert GPU slots)
+- Change: Fused+batched shared expert FFN on GPU (was entirely CPU)
+- Change: Batch attention projections (DeltaNet 4-in-1, SWA 3-in-1)
+- **35B**: 14.3 tok/s (from 3.7 baseline — 3.9x improvement, target 13+ achieved!)
+- **397B**: 0.1 tok/s (up from 0.04 — 2.5x, memory-bound by SSD-backed mmap)
+- Key insight: dispatch overhead (commit+waitUntilCompleted) was ~50% of token time
