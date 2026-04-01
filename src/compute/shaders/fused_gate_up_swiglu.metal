@@ -60,7 +60,7 @@ kernel void fused_gate_up_swiglu(
     for (uint i = k4 * 4 + tid; i < K; i += 256) {
         x_shared[i] = x[i];
     }
-    threadgroup_barrier(mem_threadgroup);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     uint K_packed = K / 8;
     uint num_groups = K / group_size;
@@ -114,7 +114,7 @@ kernel void fused_gate_up_swiglu(
         gate_partials[simd_id] = gate_sum;
         up_partials[simd_id]   = up_sum;
     }
-    threadgroup_barrier(mem_threadgroup);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     if (tid == 0) {
         float g = 0.0f, u = 0.0f;

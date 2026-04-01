@@ -54,7 +54,7 @@ kernel void matmul_q4_fma(
     for (uint i = k4 * 4 + tid; i < K; i += 256) {
         x_shared[i] = x[i];
     }
-    threadgroup_barrier(mem_threadgroup);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     // --- Compute dot product with strided assignment ---
     uint K_packed = K / 8;       // uint32s per row
@@ -106,7 +106,7 @@ kernel void matmul_q4_fma(
     if (simd_lane == 0) {
         partial_sums[simd_id] = sum;
     }
-    threadgroup_barrier(mem_threadgroup);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     // Thread 0 writes the final result
     if (tid == 0) {
@@ -150,7 +150,7 @@ kernel void matmul_bf16(
     for (uint i = k4 * 4 + tid; i < K; i += 256) {
         x_shared[i] = x[i];
     }
-    threadgroup_barrier(mem_threadgroup);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     device const ushort *row_a = A + row * K;
     float sum = 0.0f;
@@ -165,7 +165,7 @@ kernel void matmul_bf16(
     if (simd_lane == 0) {
         partial_sums[simd_id] = sum;
     }
-    threadgroup_barrier(mem_threadgroup);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     if (tid == 0) {
         float total = 0.0f;
