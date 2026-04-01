@@ -464,8 +464,31 @@ int inference_generate(InferenceContext *ctx,
         ctx->dn_idx = 0;
         embed_token(ctx, prompt_tokens[i]);
 
+        // Debug: dump hidden state after embed
+        if (i == 0) {
+            float sum2 = 0.0f;
+            for (int d = 0; d < cfg->hidden_size; d++)
+                sum2 += ctx->scratch.hidden[d] * ctx->scratch.hidden[d];
+            LOG_INFO("DEBUG embed[%d]: h[0..3]=[%.6f, %.6f, %.6f, %.6f] L2=%.4f",
+                     prompt_tokens[i],
+                     ctx->scratch.hidden[0], ctx->scratch.hidden[1],
+                     ctx->scratch.hidden[2], ctx->scratch.hidden[3],
+                     sqrtf(sum2));
+        }
+
         for (int l = 0; l < cfg->num_hidden_layers; l++) {
             forward_layer(ctx, l);
+
+            // Debug: dump hidden after first 2 layers for first token
+            if (i == 0 && l < 2) {
+                float sum2 = 0.0f;
+                for (int d = 0; d < cfg->hidden_size; d++)
+                    sum2 += ctx->scratch.hidden[d] * ctx->scratch.hidden[d];
+                LOG_INFO("DEBUG layer[%d]: h[0..3]=[%.6f, %.6f, %.6f, %.6f] L2=%.4f",
+                         l, ctx->scratch.hidden[0], ctx->scratch.hidden[1],
+                         ctx->scratch.hidden[2], ctx->scratch.hidden[3],
+                         sqrtf(sum2));
+            }
         }
     }
 
