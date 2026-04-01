@@ -46,3 +46,16 @@
 - Overlaps expert GPU execution with next layer's attention start
 - **35B**: 13.4 tok/s (no regression)
 - **397B**: 2.7 tok/s cold, 5.5 tok/s warm (marginal — model produces few tokens before EOS)
+
+## Phase 7: FMA dequant restructuring in Metal shaders
+- Change: Pre-compute scale*x and bias*x, accumulate bias terms separately, chain FMA
+- **35B**: 13.2 tok/s (within noise — original already used FMA intrinsics)
+- **397B**: 5.3 tok/s warm (within noise)
+- Note: Improvement may be more pronounced on sustained computation with longer sequences
+
+## Summary
+| Model | Baseline | Current | Improvement |
+|-------|----------|---------|-------------|
+| 35B   | 3.7 tok/s | 13.2 tok/s | 3.6x |
+| 397B  | 0.05 tok/s | 5.3 tok/s (warm) | 106x |
+| 397B  | 0.05 tok/s | 2.7 tok/s (cold) | 54x |
