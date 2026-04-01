@@ -695,13 +695,15 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
             batch_count++;
         }
 
-        // Deferred: commit GPU work without waiting. Accumulation happens
-        // at the start of the next layer (or after the last layer).
-        ctx->prev_expert_signal = kernel_end_batch_deferred(batch);
+        // Synchronous: wait for GPU work and accumulate immediately
+        kernel_end_batch(batch);
         for (int k = 0; k < batch_count; k++) {
-            ctx->prev_expert_weights[k] = top_weights[k];
+            float weight = top_weights[k];
+            float *result = ctx->cpu_result_slots[k];
+            for (int i = 0; i < H; i++) {
+                s->hidden[i] += weight * result[i];
+            }
         }
-        ctx->prev_expert_count = batch_count;
     } else if (ctx->use_gpu && K_active <= ctx->num_expert_slots) {
         // mmap-based GPU path (fallback when pread not available)
         void *expert_buf = model_get_expert_metal_buf(ctx->model, layer_idx);
@@ -742,12 +744,14 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
                 batch_count++;
             }
 
-            // Deferred for mmap path too
-            ctx->prev_expert_signal = kernel_end_batch_deferred(batch);
+            kernel_end_batch(batch);
             for (int k = 0; k < batch_count; k++) {
-                ctx->prev_expert_weights[k] = top_weights[k];
+                float weight = top_weights[k];
+                float *result = ctx->cpu_result_slots[k];
+                for (int i = 0; i < H; i++) {
+                    s->hidden[i] += weight * result[i];
+                }
             }
-            ctx->prev_expert_count = batch_count;
         }
     } else
 #endif
