@@ -470,6 +470,22 @@ void attention_deltanet_forward(
     q4_proj(z, hidden, model, gpu, base_z, z_dim, H);
 #endif
 
+    // DIAG: after QKV projection
+    if (layer_idx == 0) {
+        float ss = 0.0f;
+        for (int i = 0; i < conv_dim; i++) ss += qkv[i] * qkv[i];
+        fprintf(stderr, "[DN-DIAG L%d] qkv_proj rms=%.6f first4=[%.6f,%.6f,%.6f,%.6f]\n",
+                layer_idx, sqrtf(ss/(float)conv_dim), qkv[0], qkv[1], qkv[2], qkv[3]);
+        float ss_z = 0.0f;
+        for (int i = 0; i < z_dim; i++) ss_z += z[i] * z[i];
+        fprintf(stderr, "[DN-DIAG L%d] z_proj rms=%.6f first4=[%.6f,%.6f,%.6f,%.6f]\n",
+                layer_idx, sqrtf(ss_z/(float)z_dim), z[0], z[1], z[2], z[3]);
+        fprintf(stderr, "[DN-DIAG L%d] beta_raw first4=[%.6f,%.6f,%.6f,%.6f]\n",
+                layer_idx, b_raw[0], b_raw[1], b_raw[2], b_raw[3]);
+        fprintf(stderr, "[DN-DIAG L%d] alpha_raw first4=[%.6f,%.6f,%.6f,%.6f]\n",
+                layer_idx, a_raw[0], a_raw[1], a_raw[2], a_raw[3]);
+    }
+
     // 2. Causal conv1d with state tracking
     int kernel_size = cfg->linear_attn.linear_conv_kernel_dim;
     float *conv_weight = calloc((size_t)conv_dim * (size_t)kernel_size, sizeof(float));
@@ -497,6 +513,14 @@ void attention_deltanet_forward(
         qkv[c] = sum / (1.0f + expf(-sum));
     }
 
+    // DIAG: after conv1d+SiLU
+    if (layer_idx == 0) {
+        float ss = 0.0f;
+        for (int i = 0; i < conv_dim; i++) ss += qkv[i] * qkv[i];
+        fprintf(stderr, "[DN-DIAG L%d] after conv1d rms=%.6f first4=[%.6f,%.6f,%.6f,%.6f]\n",
+                layer_idx, sqrtf(ss/(float)conv_dim), qkv[0], qkv[1], qkv[2], qkv[3]);
+    }
+
     // 3. Split QKV
     float *query = qkv;
     float *key = qkv + key_dim;
@@ -521,19 +545,44 @@ void attention_deltanet_forward(
         g[i] = -expf(A_log[i]) * softplus(a_raw[i] + dt_bias_w[i]);
     }
 
-    // 6. L2 normalize Q and K per head
-    // Note: use_qk_l2norm_in_kernel=True is the default for Qwen 3.5
-    for (int h = 0; h < num_k_heads; h++) {
-        l2norm(query + h * head_k_dim, head_k_dim);
-        l2norm(key + h * head_k_dim, head_k_dim);
+    // 6. RMS normalize Q and K per head (bare, no weights)
+    // Matches flash-moe exactly: Q = rms_norm(q) * inv_scale^2, K = rms_norm(k) * inv_scale
+    // where inv_scale = 1/sqrt(head_k_dim)
+    {
+        float inv_scale = 1.0f / sqrtf((float)head_k_dim);
+        float q_post_scale = inv_scale * inv_scale;  // 1/head_k_dim
+        for (int h = 0; h < num_k_heads; h++) {
+            float *qh = query + h * head_k_dim;
+            float *kh = key + h * head_k_dim;
+
+            // RMS norm Q (bare) then scale by inv_scale^2
+            float ss_q = 0.0f;
+            for (int d = 0; d < head_k_dim; d++) ss_q += qh[d] * qh[d];
+            float inv_rms_q = 1.0f / sqrtf(ss_q / (float)head_k_dim + 1e-6f);
+            for (int d = 0; d < head_k_dim; d++) qh[d] = qh[d] * inv_rms_q * q_post_scale;
+
+            // RMS norm K (bare) then scale by inv_scale
+            float ss_k = 0.0f;
+            for (int d = 0; d < head_k_dim; d++) ss_k += kh[d] * kh[d];
+            float inv_rms_k = 1.0f / sqrtf(ss_k / (float)head_k_dim + 1e-6f);
+            for (int d = 0; d < head_k_dim; d++) kh[d] = kh[d] * inv_rms_k * inv_scale;
+        }
     }
 
-    // Prefetch expert weights for the next MoE layer (optimization hint)
-    // This happens during attention compute so the expert pages are ready
-
-    // 7. Scale Q
-    float q_scale = 1.0f / sqrtf((float)head_k_dim);
-    for (int i = 0; i < key_dim; i++) query[i] *= q_scale;
+    // DIAG: after Q/K normalization
+    if (layer_idx == 0) {
+        float ss_q = 0.0f, ss_k = 0.0f;
+        for (int i = 0; i < key_dim; i++) ss_q += query[i] * query[i];
+        for (int i = 0; i < key_dim; i++) ss_k += key[i] * key[i];
+        fprintf(stderr, "[DN-DIAG L%d] after QK_norm: Q rms=%.6f first4=[%.8f,%.8f,%.8f,%.8f]\n",
+                layer_idx, sqrtf(ss_q/(float)key_dim), query[0], query[1], query[2], query[3]);
+        fprintf(stderr, "[DN-DIAG L%d] after QK_norm: K rms=%.6f first4=[%.8f,%.8f,%.8f,%.8f]\n",
+                layer_idx, sqrtf(ss_k/(float)key_dim), key[0], key[1], key[2], key[3]);
+        float ss_v = 0.0f;
+        for (int i = 0; i < value_dim; i++) ss_v += value[i] * value[i];
+        fprintf(stderr, "[DN-DIAG L%d] V rms=%.6f first4=[%.8f,%.8f,%.8f,%.8f]\n",
+                layer_idx, sqrtf(ss_v/(float)value_dim), value[0], value[1], value[2], value[3]);
+    }
 
     // 8. Recurrent state update (per head)
     // State S is [num_k_heads, head_k_dim, head_v_dim]
@@ -645,6 +694,14 @@ void attention_deltanet_forward(
         }
     }
 
+    // DIAG: after recurrence
+    if (layer_idx == 0) {
+        float ss = 0.0f;
+        for (int i = 0; i < value_dim; i++) ss += core_out[i] * core_out[i];
+        fprintf(stderr, "[DN-DIAG L%d] core_out rms=%.6f first4=[%.8f,%.8f,%.8f,%.8f]\n",
+                layer_idx, sqrtf(ss/(float)value_dim), core_out[0], core_out[1], core_out[2], core_out[3]);
+    }
+
     // 9. RMSNormGated: rmsnorm(core_out) * silu(z)
     float *norm_w = calloc((size_t)head_v_dim, sizeof(float));
     snprintf(wname, sizeof(wname), "layers.%d.linear_attn.norm.weight", layer_idx);
@@ -666,9 +723,25 @@ void attention_deltanet_forward(
         }
     }
 
+    // DIAG: after gated RMSNorm
+    if (layer_idx == 0) {
+        float ss = 0.0f;
+        for (int i = 0; i < value_dim; i++) ss += core_out[i] * core_out[i];
+        fprintf(stderr, "[DN-DIAG L%d] after gated_norm rms=%.6f first4=[%.8f,%.8f,%.8f,%.8f]\n",
+                layer_idx, sqrtf(ss/(float)value_dim), core_out[0], core_out[1], core_out[2], core_out[3]);
+    }
+
     // 10. Output projection
     snprintf(base, sizeof(base), "layers.%d.linear_attn.out_proj", layer_idx);
     q4_proj(attn_out, core_out, model, gpu, base, H, value_dim);
+
+    // DIAG: after o_proj
+    if (layer_idx == 0) {
+        float ss = 0.0f;
+        for (int i = 0; i < H; i++) ss += attn_out[i] * attn_out[i];
+        fprintf(stderr, "[DN-DIAG L%d] o_proj out rms=%.6f first4=[%.8f,%.8f,%.8f,%.8f]\n",
+                layer_idx, sqrtf(ss/(float)H), attn_out[0], attn_out[1], attn_out[2], attn_out[3]);
+    }
 
     free(qkv); free(b_raw); free(beta); free(a_raw);
     free(A_log); free(dt_bias_w); free(g); free(z);
