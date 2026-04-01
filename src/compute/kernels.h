@@ -111,6 +111,15 @@ void kernel_fused_gate_up_swiglu_offsets(MetalContext *ctx,
                                           uint32_t moe_dim, uint32_t K,
                                           uint32_t group_size);
 
+// Batch-compatible: encode fused kernel into an existing batch (no commit)
+void kernel_batch_fused_gate_up_swiglu_offsets(void *batch,
+                                                void *weight_buf,
+                                                size_t gw_off, size_t gs_off, size_t gb_off,
+                                                size_t uw_off, size_t us_off, size_t ub_off,
+                                                void *x, void *out,
+                                                uint32_t moe_dim, uint32_t K,
+                                                uint32_t group_size);
+
 // Fused MoE combine + shared expert + residual add
 void kernel_moe_combine_residual(MetalContext *ctx,
                                   void *residual, void *shared_expert,

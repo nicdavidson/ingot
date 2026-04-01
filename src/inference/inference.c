@@ -401,23 +401,72 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     float *gate_out = arena_alloc(&ctx->arena, (size_t)moe_dim * sizeof(float));
     float *up_out   = arena_alloc(&ctx->arena, (size_t)moe_dim * sizeof(float));
     float *ffn_mid  = arena_alloc(&ctx->arena, (size_t)moe_dim * sizeof(float));
+    bool shared_on_gpu = false;
 
-    snprintf(name, sizeof(name), "layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
-    snprintf(sname, sizeof(sname), "layers.%d.mlp.shared_expert.gate_proj.scales", layer_idx);
-    snprintf(bname, sizeof(bname), "layers.%d.mlp.shared_expert.gate_proj.biases", layer_idx);
-    q4_matmul(ctx, gate_out, s->norm_out, name, sname, bname, moe_dim, H, 64);
+#ifdef PLATFORM_MACOS
+    if (ctx->use_gpu) {
+        // GPU path: fused gate+up+SwiGLU + batched down_proj (1 commit total)
+        char gw[128], gs_n[128], gb_n[128], uw[128], us_n[128], ub_n[128];
+        char dw[128], ds_n[128], db_n[128];
+        snprintf(gw, sizeof(gw), "layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
+        snprintf(gs_n, sizeof(gs_n), "layers.%d.mlp.shared_expert.gate_proj.scales", layer_idx);
+        snprintf(gb_n, sizeof(gb_n), "layers.%d.mlp.shared_expert.gate_proj.biases", layer_idx);
+        snprintf(uw, sizeof(uw), "layers.%d.mlp.shared_expert.up_proj.weight", layer_idx);
+        snprintf(us_n, sizeof(us_n), "layers.%d.mlp.shared_expert.up_proj.scales", layer_idx);
+        snprintf(ub_n, sizeof(ub_n), "layers.%d.mlp.shared_expert.up_proj.biases", layer_idx);
+        snprintf(dw, sizeof(dw), "layers.%d.mlp.shared_expert.down_proj.weight", layer_idx);
+        snprintf(ds_n, sizeof(ds_n), "layers.%d.mlp.shared_expert.down_proj.scales", layer_idx);
+        snprintf(db_n, sizeof(db_n), "layers.%d.mlp.shared_expert.down_proj.biases", layer_idx);
 
-    snprintf(name, sizeof(name), "layers.%d.mlp.shared_expert.up_proj.weight", layer_idx);
-    snprintf(sname, sizeof(sname), "layers.%d.mlp.shared_expert.up_proj.scales", layer_idx);
-    snprintf(bname, sizeof(bname), "layers.%d.mlp.shared_expert.up_proj.biases", layer_idx);
-    q4_matmul(ctx, up_out, s->norm_out, name, sname, bname, moe_dim, H, 64);
+        long gw_off = model_get_weight_offset(ctx->model, gw);
+        long gs_off = model_get_weight_offset(ctx->model, gs_n);
+        long gb_off = model_get_weight_offset(ctx->model, gb_n);
+        long uw_off = model_get_weight_offset(ctx->model, uw);
+        long us_off = model_get_weight_offset(ctx->model, us_n);
+        long ub_off = model_get_weight_offset(ctx->model, ub_n);
+        long dw_off = model_get_weight_offset(ctx->model, dw);
+        long ds_off = model_get_weight_offset(ctx->model, ds_n);
+        long db_off = model_get_weight_offset(ctx->model, db_n);
 
-    cpu_silu_mul(ffn_mid, gate_out, up_out, moe_dim);
+        if (gw_off >= 0 && uw_off >= 0 && dw_off >= 0) {
+            void *batch = kernel_begin_batch(ctx->metal);
 
-    snprintf(name, sizeof(name), "layers.%d.mlp.shared_expert.down_proj.weight", layer_idx);
-    snprintf(sname, sizeof(sname), "layers.%d.mlp.shared_expert.down_proj.scales", layer_idx);
-    snprintf(bname, sizeof(bname), "layers.%d.mlp.shared_expert.down_proj.biases", layer_idx);
-    q4_matmul(ctx, s->expert_out, ffn_mid, name, sname, bname, H, moe_dim, 64);
+            kernel_batch_fused_gate_up_swiglu_offsets(batch, ctx->shared_buf,
+                                                      (size_t)gw_off, (size_t)gs_off, (size_t)gb_off,
+                                                      (size_t)uw_off, (size_t)us_off, (size_t)ub_off,
+                                                      ctx->gpu_norm_out, ctx->gpu_ffn_mid,
+                                                      (uint32_t)moe_dim, (uint32_t)H, 64);
+
+            kernel_batch_q4_fma_offsets(batch, ctx->shared_buf,
+                                        (size_t)dw_off, (size_t)ds_off, (size_t)db_off,
+                                        ctx->gpu_ffn_mid, ctx->gpu_expert_result,
+                                        (uint32_t)H, (uint32_t)moe_dim, 64);
+
+            kernel_end_batch(batch);
+            memcpy(s->expert_out, ctx->cpu_expert_result, (size_t)H * sizeof(float));
+            shared_on_gpu = true;
+        }
+    }
+#endif
+
+    if (!shared_on_gpu) {
+        snprintf(name, sizeof(name), "layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
+        snprintf(sname, sizeof(sname), "layers.%d.mlp.shared_expert.gate_proj.scales", layer_idx);
+        snprintf(bname, sizeof(bname), "layers.%d.mlp.shared_expert.gate_proj.biases", layer_idx);
+        q4_matmul(ctx, gate_out, s->norm_out, name, sname, bname, moe_dim, H, 64);
+
+        snprintf(name, sizeof(name), "layers.%d.mlp.shared_expert.up_proj.weight", layer_idx);
+        snprintf(sname, sizeof(sname), "layers.%d.mlp.shared_expert.up_proj.scales", layer_idx);
+        snprintf(bname, sizeof(bname), "layers.%d.mlp.shared_expert.up_proj.biases", layer_idx);
+        q4_matmul(ctx, up_out, s->norm_out, name, sname, bname, moe_dim, H, 64);
+
+        cpu_silu_mul(ffn_mid, gate_out, up_out, moe_dim);
+
+        snprintf(name, sizeof(name), "layers.%d.mlp.shared_expert.down_proj.weight", layer_idx);
+        snprintf(sname, sizeof(sname), "layers.%d.mlp.shared_expert.down_proj.scales", layer_idx);
+        snprintf(bname, sizeof(bname), "layers.%d.mlp.shared_expert.down_proj.biases", layer_idx);
+        q4_matmul(ctx, s->expert_out, ffn_mid, name, sname, bname, H, moe_dim, 64);
+    }
 
     // Apply shared_expert_gate: sigmoid gate that weights the shared expert
     float shared_gate_val = 1.0f;
@@ -466,27 +515,31 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
         if (ctx->use_gpu && expert_buf) {
             size_t base = (size_t)expert_idx * stride;
 
-            // Fused gate+up+SwiGLU: single kernel reads input once, does both
-            // projections and SiLU(gate)*up, eliminating batch+cpu_silu_mul
-            kernel_fused_gate_up_swiglu_offsets(ctx->metal, expert_buf,
-                                                base,
-                                                base + w_size,
-                                                base + w_size + s_size,
-                                                base + proj_size,
-                                                base + proj_size + w_size,
-                                                base + proj_size + w_size + s_size,
-                                                ctx->gpu_norm_out, ctx->gpu_ffn_mid,
-                                                (uint32_t)moe_dim, (uint32_t)H,
-                                                (uint32_t)group_size);
-
-            // down_proj — single dispatch
+            // Batch fused gate+up+SwiGLU + down_proj into one command buffer
+            // (1 commit instead of 2, Metal respects encoder ordering)
             size_t down_base = base + proj_size * 2;
-            kernel_matmul_q4_fma_offsets(ctx->metal, expert_buf,
-                                         down_base,
-                                         down_base + dw_size,
-                                         down_base + dw_size + ds_size,
-                                         ctx->gpu_ffn_mid, ctx->gpu_expert_result,
-                                         (uint32_t)H, (uint32_t)moe_dim, (uint32_t)group_size);
+            void *batch = kernel_begin_batch(ctx->metal);
+
+            kernel_batch_fused_gate_up_swiglu_offsets(batch, expert_buf,
+                                                      base,
+                                                      base + w_size,
+                                                      base + w_size + s_size,
+                                                      base + proj_size,
+                                                      base + proj_size + w_size,
+                                                      base + proj_size + w_size + s_size,
+                                                      ctx->gpu_norm_out, ctx->gpu_ffn_mid,
+                                                      (uint32_t)moe_dim, (uint32_t)H,
+                                                      (uint32_t)group_size);
+
+            kernel_batch_q4_fma_offsets(batch, expert_buf,
+                                        down_base,
+                                        down_base + dw_size,
+                                        down_base + dw_size + ds_size,
+                                        ctx->gpu_ffn_mid, ctx->gpu_expert_result,
+                                        (uint32_t)H, (uint32_t)moe_dim,
+                                        (uint32_t)group_size);
+
+            kernel_end_batch(batch);
 
             // Weighted add to hidden
             for (int i = 0; i < H; i++) {
