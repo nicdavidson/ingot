@@ -323,17 +323,25 @@ static bool load_added_tokens(Tokenizer *tok, const char *path) {
     }
 
     // Try "added_tokens_decoder" (tokenizer_config.json format: {id: {content: "..."}}),
-    // otherwise treat root object as simple map (added_tokens.json format: {content: id})
+    // otherwise treat root object as a token map
     int atd_idx = json_get(&doc, 0, "added_tokens_decoder");
     bool simple_format = false;
     if (atd_idx < 0) {
         if (doc.tokens[0].type == JSON_OBJECT) {
             atd_idx = 0;
-            simple_format = true;
         } else {
             free(tokens);
             free(json);
             return false;
+        }
+    }
+
+    // Detect format by checking first value: object = decoder, number = simple
+    if (doc.tokens[atd_idx].children > 0) {
+        int first_key = atd_idx + 1;
+        int first_val = first_key + 1;
+        if (first_val < doc.num_tokens && doc.tokens[first_val].type == JSON_NUMBER) {
+            simple_format = true;
         }
     }
 
