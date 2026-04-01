@@ -40,6 +40,11 @@ void kernel_batch_q4_fma_offsets(void *batch,
                                   uint32_t M, uint32_t K, uint32_t group_size);
 void kernel_end_batch(void *batch);
 
+// Deferred batch end: commit without waiting. Returns an opaque signal handle.
+// Call kernel_wait_deferred() to block until GPU work completes.
+void *kernel_end_batch_deferred(void *batch);
+void kernel_wait_deferred(void *signal);
+
 // BF16 matmul with threadgroup optimization
 void kernel_matmul_bf16(MetalContext *ctx,
                         void *A, void *x, void *out,

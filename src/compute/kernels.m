@@ -224,6 +224,25 @@ void kernel_end_batch(void *batch_ptr) {
     free(batch);
 }
 
+void *kernel_end_batch_deferred(void *batch_ptr) {
+    BatchContext *batch = batch_ptr;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    [batch->cb addCompletedHandler:^(id<MTLCommandBuffer> __unused buf) {
+        dispatch_semaphore_signal(sem);
+    }];
+    [batch->cb commit];
+    free(batch);
+
+    return (__bridge_retained void *)sem;
+}
+
+void kernel_wait_deferred(void *signal) {
+    if (!signal) return;
+    dispatch_semaphore_t sem = (__bridge_transfer dispatch_semaphore_t)signal;
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+}
+
 // BF16 matmul: 256-thread threadgroups, shared memory
 void kernel_matmul_bf16(MetalContext *ctx,
                         void *A, void *x, void *out,

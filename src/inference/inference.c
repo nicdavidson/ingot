@@ -77,6 +77,10 @@ struct InferenceContext {
     void           *cpu_expert_staging[16];  // CPU pointers into staging
     size_t          expert_staging_size;      // bytes per staging buffer
     ExpertIO       *expert_io;               // GCD parallel pread subsystem
+    // Deferred expert completion from previous layer
+    void           *prev_expert_signal;      // dispatch_semaphore from deferred batch
+    float           prev_expert_weights[16]; // weights for pending accumulation
+    int             prev_expert_count;       // number of pending experts
     bool            use_gpu;
 #endif
 };
@@ -216,6 +220,29 @@ InferenceContext *inference_create(Model *model) {
     LOG_INFO("inference: context created (max_seq=%d)", max_seq);
     return ctx;
 }
+
+// Complete deferred expert accumulation from previous layer
+#ifdef PLATFORM_MACOS
+static void complete_deferred_experts(InferenceContext *ctx) {
+    if (!ctx->prev_expert_signal) return;
+
+    kernel_wait_deferred(ctx->prev_expert_signal);
+    ctx->prev_expert_signal = NULL;
+
+    const ModelConfig *cfg = model_config(ctx->model);
+    int H = cfg->hidden_size;
+    ScratchBuffers *s = &ctx->scratch;
+
+    for (int k = 0; k < ctx->prev_expert_count; k++) {
+        float weight = ctx->prev_expert_weights[k];
+        float *result = ctx->cpu_result_slots[k];
+        for (int i = 0; i < H; i++) {
+            s->hidden[i] += weight * result[i];
+        }
+    }
+    ctx->prev_expert_count = 0;
+}
+#endif
 
 // --- CPU compute primitives ---
 
@@ -359,6 +386,13 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     const ModelConfig *cfg = model_config(ctx->model);
     ScratchBuffers *s = &ctx->scratch;
     int H = cfg->hidden_size;
+
+    // Complete deferred expert accumulation from previous layer.
+    // This blocks until the previous layer's expert GPU work finishes.
+    // The current layer's attention can't start until we have the correct hidden state.
+#ifdef PLATFORM_MACOS
+    complete_deferred_experts(ctx);
+#endif
 
     // Get layer norm weight (BF16 → float)
     char name[128];
@@ -634,16 +668,13 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
             batch_count++;
         }
 
-        kernel_end_batch(batch);
-
-        // Accumulate weighted results from unified memory
+        // Deferred: commit GPU work without waiting. Accumulation happens
+        // at the start of the next layer (or after the last layer).
+        ctx->prev_expert_signal = kernel_end_batch_deferred(batch);
         for (int k = 0; k < batch_count; k++) {
-            float weight = top_weights[k];
-            float *result = ctx->cpu_result_slots[k];
-            for (int i = 0; i < H; i++) {
-                s->hidden[i] += weight * result[i];
-            }
+            ctx->prev_expert_weights[k] = top_weights[k];
         }
+        ctx->prev_expert_count = batch_count;
     } else if (ctx->use_gpu && K_active <= ctx->num_expert_slots) {
         // mmap-based GPU path (fallback when pread not available)
         void *expert_buf = model_get_expert_metal_buf(ctx->model, layer_idx);
@@ -684,15 +715,12 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
                 batch_count++;
             }
 
-            kernel_end_batch(batch);
-
+            // Deferred for mmap path too
+            ctx->prev_expert_signal = kernel_end_batch_deferred(batch);
             for (int k = 0; k < batch_count; k++) {
-                float weight = top_weights[k];
-                float *result = ctx->cpu_result_slots[k];
-                for (int i = 0; i < H; i++) {
-                    s->hidden[i] += weight * result[i];
-                }
+                ctx->prev_expert_weights[k] = top_weights[k];
             }
+            ctx->prev_expert_count = batch_count;
         }
     } else
 #endif
@@ -831,6 +859,9 @@ int inference_generate(InferenceContext *ctx,
         for (int l = 0; l < cfg->num_hidden_layers; l++) {
             forward_layer(ctx, l);
         }
+#ifdef PLATFORM_MACOS
+        complete_deferred_experts(ctx);
+#endif
     }
 
     uint64_t t_prefill = timer_now_ns();
@@ -854,6 +885,9 @@ int inference_generate(InferenceContext *ctx,
             for (int l = 0; l < cfg->num_hidden_layers; l++) {
                 forward_layer(ctx, l);
             }
+#ifdef PLATFORM_MACOS
+            complete_deferred_experts(ctx);
+#endif
 
             compute_logits(ctx);
         }
