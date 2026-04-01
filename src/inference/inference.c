@@ -54,6 +54,15 @@ struct InferenceContext {
     void           *gpu_norm_out;  // Metal buffer for norm output
     void           *gpu_out;       // Metal buffer for matmul output (reusable)
     void           *gpu_logits;    // Metal buffer for logits
+    // Expert GPU scratch
+    void           *gpu_gate_out;  // Metal buffer for expert gate_proj output
+    void           *gpu_up_out;    // Metal buffer for expert up_proj output
+    void           *gpu_ffn_mid;   // Metal buffer for SiLU(gate)*up intermediate
+    void           *gpu_expert_result; // Metal buffer for expert down_proj output
+    float          *cpu_gate_out;  // CPU pointer into gpu_gate_out
+    float          *cpu_up_out;
+    float          *cpu_ffn_mid;
+    float          *cpu_expert_result;
     bool            use_gpu;
 #endif
 };
@@ -116,7 +125,17 @@ InferenceContext *inference_create(Model *model) {
         ctx->gpu_out       = metal_alloc_buffer(ctx->metal, (size_t)max_out * sizeof(float));
         ctx->gpu_logits    = metal_alloc_buffer(ctx->metal, (size_t)cfg->vocab_size * sizeof(float));
 
-        if (ctx->gpu_hidden && ctx->gpu_norm_out && ctx->gpu_out && ctx->gpu_logits) {
+        // Expert scratch buffers — size for the larger of moe_intermediate and shared_expert
+        int expert_dim = cfg->moe_intermediate_size;
+        if (cfg->shared_expert_intermediate_size > expert_dim)
+            expert_dim = cfg->shared_expert_intermediate_size;
+        ctx->gpu_gate_out      = metal_alloc_buffer(ctx->metal, (size_t)expert_dim * sizeof(float));
+        ctx->gpu_up_out        = metal_alloc_buffer(ctx->metal, (size_t)expert_dim * sizeof(float));
+        ctx->gpu_ffn_mid       = metal_alloc_buffer(ctx->metal, (size_t)expert_dim * sizeof(float));
+        ctx->gpu_expert_result = metal_alloc_buffer(ctx->metal, (size_t)H * sizeof(float));
+
+        if (ctx->gpu_hidden && ctx->gpu_norm_out && ctx->gpu_out && ctx->gpu_logits &&
+            ctx->gpu_gate_out && ctx->gpu_up_out && ctx->gpu_ffn_mid && ctx->gpu_expert_result) {
             // Point scratch arrays at the GPU buffer contents (unified memory)
             free(ctx->scratch.hidden);
             free(ctx->scratch.norm_out);
@@ -124,6 +143,10 @@ InferenceContext *inference_create(Model *model) {
             ctx->scratch.hidden   = metal_buffer_contents(ctx->gpu_hidden);
             ctx->scratch.norm_out = metal_buffer_contents(ctx->gpu_norm_out);
             ctx->scratch.logits   = metal_buffer_contents(ctx->gpu_logits);
+            ctx->cpu_gate_out      = metal_buffer_contents(ctx->gpu_gate_out);
+            ctx->cpu_up_out        = metal_buffer_contents(ctx->gpu_up_out);
+            ctx->cpu_ffn_mid       = metal_buffer_contents(ctx->gpu_ffn_mid);
+            ctx->cpu_expert_result = metal_buffer_contents(ctx->gpu_expert_result);
             ctx->use_gpu = true;
             LOG_INFO("inference: GPU acceleration enabled");
         }
@@ -406,58 +429,104 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
         ffn_mid  = arena_alloc(&ctx->arena, (size_t)moe_dim * sizeof(float));
     }
 
+    // Expert layout: gate_proj(w,s,b), up_proj(w,s,b), down_proj(w,s,b)
+    // Each projection: weight[moe_dim, H/8] + scales[moe_dim, G] + biases[moe_dim, G]
+    int group_size = 64;
+    int num_groups_h = H / group_size;
+    size_t w_size = (size_t)moe_dim * (size_t)(H / 8) * 4;      // U32
+    size_t s_size = (size_t)moe_dim * (size_t)num_groups_h * 2;  // BF16
+    size_t b_size = s_size;
+    size_t proj_size = w_size + s_size + b_size;  // one projection
+
+    int down_groups = moe_dim / group_size;
+    size_t dw_size = (size_t)H * (size_t)(moe_dim / 8) * 4;
+    size_t ds_size = (size_t)H * (size_t)down_groups * 2;
+
     for (int k = 0; k < K_active; k++) {
         int expert_idx = top_indices[k];
         float weight = top_weights[k];
 
-        // Get expert data from mmap'd file
         size_t stride;
         const void *expert_data = model_get_expert(ctx->model, layer_idx,
                                                     expert_idx, &stride);
         if (!expert_data) continue;
 
-        // Expert layout: gate_proj(w,s,b), up_proj(w,s,b), down_proj(w,s,b)
-        // Each projection: weight[moe_dim, H/8] + scales[moe_dim, G] + biases[moe_dim, G]
-        int group_size = 64;
-        int num_groups = H / group_size;
-        size_t w_size = (size_t)moe_dim * (size_t)(H / 8) * 4;       // U32
-        size_t s_size = (size_t)moe_dim * (size_t)num_groups * 2;     // BF16
-        size_t b_size = s_size;
+#ifdef PLATFORM_MACOS
+        void *expert_buf = model_get_expert_metal_buf(ctx->model, layer_idx);
+        if (ctx->use_gpu && expert_buf) {
+            // GPU path: dispatch matmuls using expert Metal buffer + offsets
+            size_t base = (size_t)expert_idx * stride;
 
-        const char *ptr = expert_data;
+            // gate_proj offsets
+            size_t gw_off = base;
+            size_t gs_off = base + w_size;
+            size_t gb_off = base + w_size + s_size;
 
-        // gate_proj
-        const void *gw = ptr; ptr += w_size;
-        const void *gs = ptr; ptr += s_size;
-        const void *gb = ptr; ptr += b_size;
-        dequant_matmul_q4(gate_out, gw, gs, gb, s->norm_out, moe_dim, H, group_size);
+            // up_proj offsets
+            size_t uw_off = base + proj_size;
+            size_t us_off = base + proj_size + w_size;
+            size_t ub_off = base + proj_size + w_size + s_size;
 
-        // up_proj
-        const void *uw = ptr; ptr += w_size;
-        const void *us = ptr; ptr += s_size;
-        const void *ub = ptr; ptr += b_size;
-        dequant_matmul_q4(up_out, uw, us, ub, s->norm_out, moe_dim, H, group_size);
+            // gate_proj → gpu_gate_out
+            kernel_matmul_q4_fma_offsets(ctx->metal, expert_buf,
+                                         gw_off, gs_off, gb_off,
+                                         ctx->gpu_norm_out, ctx->gpu_gate_out,
+                                         (uint32_t)moe_dim, (uint32_t)H, (uint32_t)group_size);
 
-        // SiLU(gate) * up
-        cpu_silu_mul(ffn_mid, gate_out, up_out, moe_dim);
+            // up_proj → gpu_up_out
+            kernel_matmul_q4_fma_offsets(ctx->metal, expert_buf,
+                                         uw_off, us_off, ub_off,
+                                         ctx->gpu_norm_out, ctx->gpu_up_out,
+                                         (uint32_t)moe_dim, (uint32_t)H, (uint32_t)group_size);
 
-        // down_proj: [H, moe_dim]
-        int down_groups = moe_dim / group_size;
-        size_t dw_size = (size_t)H * (size_t)(moe_dim / 8) * 4;
-        size_t ds_size = (size_t)H * (size_t)down_groups * 2;
-        (void)dw_size;
+            // SiLU(gate) * up — CPU for now (small op)
+            cpu_silu_mul(ctx->cpu_ffn_mid, ctx->cpu_gate_out, ctx->cpu_up_out, moe_dim);
 
-        const void *dw = ptr; ptr += dw_size;
-        const void *ds = ptr; ptr += ds_size;
-        const void *db = ptr; // remaining
-        (void)db;
+            // down_proj offsets
+            size_t down_base = base + proj_size * 2;
+            size_t dw_off = down_base;
+            size_t ds_off = down_base + dw_size;
+            size_t db_off = down_base + dw_size + ds_size;
 
-        float *expert_result = arena_alloc(&ctx->arena, (size_t)H * sizeof(float));
-        dequant_matmul_q4(expert_result, dw, ds, ptr, ffn_mid, H, moe_dim, group_size);
+            // down_proj → gpu_expert_result
+            kernel_matmul_q4_fma_offsets(ctx->metal, expert_buf,
+                                         dw_off, ds_off, db_off,
+                                         ctx->gpu_ffn_mid, ctx->gpu_expert_result,
+                                         (uint32_t)H, (uint32_t)moe_dim, (uint32_t)group_size);
 
-        // Weighted add to hidden
-        for (int i = 0; i < H; i++) {
-            s->hidden[i] += weight * expert_result[i];
+            // Weighted add to hidden
+            for (int i = 0; i < H; i++) {
+                s->hidden[i] += weight * ctx->cpu_expert_result[i];
+            }
+        } else
+#endif
+        {
+            // CPU fallback
+            const char *ptr = expert_data;
+
+            const void *gw = ptr; ptr += w_size;
+            const void *gs = ptr; ptr += s_size;
+            const void *gb = ptr; ptr += b_size;
+            dequant_matmul_q4(gate_out, gw, gs, gb, s->norm_out, moe_dim, H, group_size);
+
+            const void *uw = ptr; ptr += w_size;
+            const void *us = ptr; ptr += s_size;
+            const void *ub = ptr; ptr += b_size;
+            dequant_matmul_q4(up_out, uw, us, ub, s->norm_out, moe_dim, H, group_size);
+
+            cpu_silu_mul(ffn_mid, gate_out, up_out, moe_dim);
+
+            const void *dw = ptr; ptr += dw_size;
+            const void *ds = ptr; ptr += ds_size;
+            const void *db = ptr;
+            (void)db;
+
+            float *expert_result = arena_alloc(&ctx->arena, (size_t)H * sizeof(float));
+            dequant_matmul_q4(expert_result, dw, ds, ptr, ffn_mid, H, moe_dim, group_size);
+
+            for (int i = 0; i < H; i++) {
+                s->hidden[i] += weight * expert_result[i];
+            }
         }
     }
 
@@ -612,6 +681,10 @@ void inference_free(InferenceContext *ctx) {
         metal_free_buffer(ctx->gpu_norm_out);
         metal_free_buffer(ctx->gpu_out);
         metal_free_buffer(ctx->gpu_logits);
+        metal_free_buffer(ctx->gpu_gate_out);
+        metal_free_buffer(ctx->gpu_up_out);
+        metal_free_buffer(ctx->gpu_ffn_mid);
+        metal_free_buffer(ctx->gpu_expert_result);
     }
 #endif
 

@@ -34,6 +34,7 @@ struct Model {
 #ifdef PLATFORM_MACOS
     MetalContext *metal_ctx;
     void         *shared_mtl_buf;  // Metal buffer wrapping shared weights
+    void        **expert_mtl_bufs; // Metal buffers wrapping expert files (zero-copy)
 #endif
 };
 
@@ -157,6 +158,23 @@ Model *model_load(const char *model_dir) {
             model->shared_weights,
             model->shared_weights_size);
     }
+
+    // Wrap expert files as Metal buffers (zero-copy via unified memory)
+    if (model->num_expert_files > 0) {
+        model->expert_mtl_bufs = calloc((size_t)model->num_expert_files, sizeof(void *));
+        int wrapped = 0;
+        for (int i = 0; i < model->num_expert_files; i++) {
+            if (model->expert_data[i] && model->expert_sizes[i] > 0) {
+                model->expert_mtl_bufs[i] = metal_wrap_buffer(
+                    model->metal_ctx,
+                    model->expert_data[i],
+                    model->expert_sizes[i]);
+                if (model->expert_mtl_bufs[i]) wrapped++;
+            }
+        }
+        LOG_INFO("model: wrapped %d/%d expert files as Metal buffers",
+                 wrapped, model->num_expert_files);
+    }
 #endif
 
     uint64_t t1 = timer_now_ns();
@@ -169,6 +187,12 @@ void model_free(Model *model) {
     if (!model) return;
 
 #ifdef PLATFORM_MACOS
+    if (model->expert_mtl_bufs) {
+        for (int i = 0; i < model->num_expert_files; i++) {
+            metal_free_buffer(model->expert_mtl_bufs[i]);
+        }
+        free(model->expert_mtl_bufs);
+    }
     if (model->shared_mtl_buf) {
         metal_free_buffer(model->shared_mtl_buf);
     }
@@ -219,6 +243,13 @@ MetalContext *model_get_metal(const Model *model) {
 
 void *model_get_metal_shared_buf(const Model *model) {
     return model->shared_mtl_buf;
+}
+
+void *model_get_expert_metal_buf(const Model *model, int layer_idx) {
+    if (!model->expert_mtl_bufs || layer_idx < 0 ||
+        layer_idx >= model->num_expert_files)
+        return NULL;
+    return model->expert_mtl_bufs[layer_idx];
 }
 #endif
 

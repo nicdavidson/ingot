@@ -39,6 +39,10 @@ MetalContext *model_get_metal(const Model *model);
 
 // Get Metal buffer wrapping shared weights (zero-copy).
 void *model_get_metal_shared_buf(const Model *model);
+
+// Get Metal buffer wrapping an expert layer file (zero-copy).
+// Returns NULL if not available.
+void *model_get_expert_metal_buf(const Model *model, int layer_idx);
 #endif
 
 // Get a pointer to expert weight data for a specific expert in a layer.
