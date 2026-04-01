@@ -442,7 +442,7 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     }
 
     // Debug: track hidden state norms to find corruption
-    if (ctx->position == 0 && (layer_idx < 3 || layer_idx % 10 == 0 ||
+    if (ctx->position == 0 && (layer_idx < 3 || layer_idx >= 20 ||
                                 layer_idx == cfg->num_hidden_layers - 1)) {
         const char *ltype = (cfg->layer_types && cfg->layer_types[layer_idx] == LAYER_FULL_ATTENTION)
                             ? "SWA" : "DN";
@@ -782,7 +782,7 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     }
 
     // Debug: track hidden state norms after MoE
-    if (ctx->position == 0 && (layer_idx < 3 || layer_idx % 10 == 0 ||
+    if (ctx->position == 0 && (layer_idx < 3 || layer_idx >= 20 ||
                                 layer_idx == cfg->num_hidden_layers - 1)) {
         LOG_INFO("debug L%d post-moe: hidden_norm=%.4f", layer_idx,
                  debug_l2norm(s->hidden, H));
