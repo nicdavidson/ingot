@@ -26,7 +26,7 @@ void dequant_row_q4(
 
     for (int g = 0; g < num_groups; g++) {
         float scale = bf16_to_f32(scales[g]);
-        float zero  = bf16_to_f32(biases[g]);
+        float bias  = bf16_to_f32(biases[g]);
 
         int base_k = g * group_size;
 
@@ -40,7 +40,7 @@ void dequant_row_q4(
                 int val = (int)((packed >> (b * 4)) & 0xF);
                 int k = base_k + u * 8 + b;
                 if (k < K) {
-                    out[k] = ((float)val - zero) * scale;
+                    out[k] = (float)val * scale + bias;
                 }
             }
         }
@@ -74,7 +74,7 @@ void dequant_matmul_q4(
 
         for (int g = 0; g < num_groups; g++) {
             float scale = bf16_to_f32(row_s[g]);
-            float zero  = bf16_to_f32(row_b[g]);
+            float bias  = bf16_to_f32(row_b[g]);
 
             int base_k = g * group_size;
             int u32_base = g * u32s_per_group;
@@ -83,28 +83,18 @@ void dequant_matmul_q4(
                 uint32_t packed = row_w[u32_base + u];
                 int k_start = base_k + u * 8;
 
-                // FMA-restructured dequant: fma(nibble, scale*x, -zero*scale*x)
-                // Saturates FMA pipeline instead of creating dependency chain
-                // Original: sum += ((val - zero) * scale) * x[k]
-                // Restructured: sum += fma(val, scale*x[k], -zero*scale*x[k])
-                float sx0 = scale * x[k_start];
-                float sx1 = scale * x[k_start + 1];
-                float sx2 = scale * x[k_start + 2];
-                float sx3 = scale * x[k_start + 3];
-                float sx4 = scale * x[k_start + 4];
-                float sx5 = scale * x[k_start + 5];
-                float sx6 = scale * x[k_start + 6];
-                float sx7 = scale * x[k_start + 7];
-
-                float nz = -zero;
-                sum += fmaf((float)((packed)       & 0xF), sx0, nz * sx0);
-                sum += fmaf((float)((packed >> 4)  & 0xF), sx1, nz * sx1);
-                sum += fmaf((float)((packed >> 8)  & 0xF), sx2, nz * sx2);
-                sum += fmaf((float)((packed >> 12) & 0xF), sx3, nz * sx3);
-                sum += fmaf((float)((packed >> 16) & 0xF), sx4, nz * sx4);
-                sum += fmaf((float)((packed >> 20) & 0xF), sx5, nz * sx5);
-                sum += fmaf((float)((packed >> 24) & 0xF), sx6, nz * sx6);
-                sum += fmaf((float)((packed >> 28) & 0xF), sx7, nz * sx7);
+                // FMA-restructured affine dequant: fma(nibble, scale*x, bias*x)
+                // Correct formula: dequant = nibble * scale + bias
+                // FMA form: sum += (nibble * scale + bias) * x = fma(nibble, scale*x, bias*x)
+                const float *xp = x + k_start;
+                sum += fmaf((float)((packed)       & 0xF), scale * xp[0], bias * xp[0]);
+                sum += fmaf((float)((packed >> 4)  & 0xF), scale * xp[1], bias * xp[1]);
+                sum += fmaf((float)((packed >> 8)  & 0xF), scale * xp[2], bias * xp[2]);
+                sum += fmaf((float)((packed >> 12) & 0xF), scale * xp[3], bias * xp[3]);
+                sum += fmaf((float)((packed >> 16) & 0xF), scale * xp[4], bias * xp[4]);
+                sum += fmaf((float)((packed >> 20) & 0xF), scale * xp[5], bias * xp[5]);
+                sum += fmaf((float)((packed >> 24) & 0xF), scale * xp[6], bias * xp[6]);
+                sum += fmaf((float)((packed >> 28) & 0xF), scale * xp[7], bias * xp[7]);
             }
         }
 

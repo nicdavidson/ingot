@@ -73,29 +73,21 @@ kernel void matmul_q4_fma(
         // Which group does this uint32 belong to?
         uint g = u / u32s_per_group;
         float scale = bf16_to_float(row_s[g]);
-        float nzero = -bf16_to_float(row_b[g]);
+        float bias  = bf16_to_float(row_b[g]);
 
         uint32_t packed = row_w[u];
         uint k_base = u * 8;
 
-        // FMA-restructured: fma(nibble, scale*x, -zero*scale*x)
-        float sx0 = scale * x_shared[k_base];
-        float sx1 = scale * x_shared[k_base + 1];
-        float sx2 = scale * x_shared[k_base + 2];
-        float sx3 = scale * x_shared[k_base + 3];
-        float sx4 = scale * x_shared[k_base + 4];
-        float sx5 = scale * x_shared[k_base + 5];
-        float sx6 = scale * x_shared[k_base + 6];
-        float sx7 = scale * x_shared[k_base + 7];
-
-        sum += fma(float(packed        & 0xF), sx0, nzero * sx0);
-        sum += fma(float((packed >> 4)  & 0xF), sx1, nzero * sx1);
-        sum += fma(float((packed >> 8)  & 0xF), sx2, nzero * sx2);
-        sum += fma(float((packed >> 12) & 0xF), sx3, nzero * sx3);
-        sum += fma(float((packed >> 16) & 0xF), sx4, nzero * sx4);
-        sum += fma(float((packed >> 20) & 0xF), sx5, nzero * sx5);
-        sum += fma(float((packed >> 24) & 0xF), sx6, nzero * sx6);
-        sum += fma(float((packed >> 28) & 0xF), sx7, nzero * sx7);
+        // FMA-restructured affine dequant: fma(nibble, scale*x, bias*x)
+        // Correct formula: dequant = nibble * scale + bias
+        sum += fma(float(packed        & 0xF), scale * x_shared[k_base],     bias * x_shared[k_base]);
+        sum += fma(float((packed >> 4)  & 0xF), scale * x_shared[k_base + 1], bias * x_shared[k_base + 1]);
+        sum += fma(float((packed >> 8)  & 0xF), scale * x_shared[k_base + 2], bias * x_shared[k_base + 2]);
+        sum += fma(float((packed >> 12) & 0xF), scale * x_shared[k_base + 3], bias * x_shared[k_base + 3]);
+        sum += fma(float((packed >> 16) & 0xF), scale * x_shared[k_base + 4], bias * x_shared[k_base + 4]);
+        sum += fma(float((packed >> 20) & 0xF), scale * x_shared[k_base + 5], bias * x_shared[k_base + 5]);
+        sum += fma(float((packed >> 24) & 0xF), scale * x_shared[k_base + 6], bias * x_shared[k_base + 6]);
+        sum += fma(float((packed >> 28) & 0xF), scale * x_shared[k_base + 7], bias * x_shared[k_base + 7]);
     }
 
     // --- SIMD reduction within each simdgroup ---
