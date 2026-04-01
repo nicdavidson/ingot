@@ -16,25 +16,6 @@
 
 // --- Helpers ---
 
-// Page-aligned allocation for Metal buffer compatibility.
-// newBufferWithBytesNoCopy requires page-aligned pointers.
-#define PAGE_SIZE 16384
-
-static void *aligned_calloc(size_t count, size_t elem_size) {
-    size_t total = count * elem_size;
-    // Round up to page boundary
-    total = (total + PAGE_SIZE - 1) & ~((size_t)PAGE_SIZE - 1);
-    void *ptr = NULL;
-    if (posix_memalign(&ptr, PAGE_SIZE, total) != 0) return NULL;
-    memset(ptr, 0, total);
-    return ptr;
-}
-
-// Round size up to page boundary for metal_wrap_buffer
-static size_t page_align(size_t size) {
-    return (size + PAGE_SIZE - 1) & ~((size_t)PAGE_SIZE - 1);
-}
-
 static void q4_proj(float *out, const float *x, const Model *model,
                     const char *base, int M, int K) {
     char wn[128], sn[128], bn[128];
@@ -43,7 +24,9 @@ static void q4_proj(float *out, const float *x, const Model *model,
     snprintf(bn, sizeof(bn), "%s.biases", base);
 
 #ifdef PLATFORM_MACOS
-    // Try GPU dispatch via shared Metal buffer
+    // GPU dispatch via temporary Metal buffers.
+    // We allocate temp GPU buffers because the input may already live inside
+    // another Metal buffer (unified memory), so newBufferWithBytesNoCopy fails.
     MetalContext *metal = model_get_metal(model);
     void *shared_buf = model_get_metal_shared_buf(model);
     if (metal && shared_buf) {
@@ -51,23 +34,21 @@ static void q4_proj(float *out, const float *x, const Model *model,
         long s_off = model_get_weight_offset(model, sn);
         long b_off = model_get_weight_offset(model, bn);
         if (w_off >= 0 && s_off >= 0 && b_off >= 0) {
-            // Wrap input and output as temporary Metal buffers
-            // Sizes must be page-aligned for newBufferWithBytesNoCopy
-            void *x_buf = metal_wrap_buffer(metal, (void *)x,
-                                            page_align((size_t)K * sizeof(float)));
-            void *out_buf = metal_wrap_buffer(metal, out,
-                                              page_align((size_t)M * sizeof(float)));
-            if (x_buf && out_buf) {
+            void *x_gpu = metal_alloc_buffer(metal, (size_t)K * sizeof(float));
+            void *out_gpu = metal_alloc_buffer(metal, (size_t)M * sizeof(float));
+            if (x_gpu && out_gpu) {
+                memcpy(metal_buffer_contents(x_gpu), x, (size_t)K * sizeof(float));
                 kernel_matmul_q4_fma_offsets(metal, shared_buf,
                                              (size_t)w_off, (size_t)s_off, (size_t)b_off,
-                                             x_buf, out_buf,
+                                             x_gpu, out_gpu,
                                              (uint32_t)M, (uint32_t)K, 64);
-                metal_free_buffer(x_buf);
-                metal_free_buffer(out_buf);
+                memcpy(out, metal_buffer_contents(out_gpu), (size_t)M * sizeof(float));
+                metal_free_buffer(x_gpu);
+                metal_free_buffer(out_gpu);
                 return;
             }
-            if (x_buf) metal_free_buffer(x_buf);
-            if (out_buf) metal_free_buffer(out_buf);
+            if (x_gpu) metal_free_buffer(x_gpu);
+            if (out_gpu) metal_free_buffer(out_gpu);
         }
     }
 #endif
@@ -141,9 +122,9 @@ void attention_swa_forward(
 
     char base[128];
 
-    float *q_full = aligned_calloc((size_t)q_proj_dim, sizeof(float));
-    float *k = aligned_calloc((size_t)kv_dim, sizeof(float));
-    float *v = aligned_calloc((size_t)kv_dim, sizeof(float));
+    float *q_full = calloc((size_t)q_proj_dim, sizeof(float));
+    float *k = calloc((size_t)kv_dim, sizeof(float));
+    float *v = calloc((size_t)kv_dim, sizeof(float));
 
     // Q/K/V projections
     snprintf(base, sizeof(base), "layers.%d.self_attn.q_proj", layer_idx);
@@ -156,8 +137,8 @@ void attention_swa_forward(
     // Split q_proj into query and gate
     // q_full is laid out as [num_heads, head_dim*2] when gated
     // We need to split each head's chunk: first head_dim = query, second = gate
-    float *q = aligned_calloc((size_t)q_dim, sizeof(float));
-    float *gate = cfg->attn_output_gate ? aligned_calloc((size_t)q_dim, sizeof(float)) : NULL;
+    float *q = calloc((size_t)q_dim, sizeof(float));
+    float *gate = cfg->attn_output_gate ? calloc((size_t)q_dim, sizeof(float)) : NULL;
 
     if (cfg->attn_output_gate) {
         for (int h = 0; h < num_heads; h++) {
@@ -229,7 +210,7 @@ void attention_swa_forward(
     // GQA Attention
     float scale = 1.0f / sqrtf((float)head_dim);
     int kv_group = num_heads / num_kv_heads;
-    float *head_out = aligned_calloc((size_t)q_dim, sizeof(float));
+    float *head_out = calloc((size_t)q_dim, sizeof(float));
 
     for (int h = 0; h < num_heads; h++) {
         int kv_h = h / kv_group;
@@ -302,7 +283,7 @@ void attention_deltanet_forward(
     char base[128], wname[128];
 
     // 1. QKV projection: hidden → [key_dim + key_dim + value_dim]
-    float *qkv = aligned_calloc((size_t)conv_dim, sizeof(float));
+    float *qkv = calloc((size_t)conv_dim, sizeof(float));
     snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_qkv", layer_idx);
     q4_proj(qkv, hidden, model, base, conv_dim, H);
 
@@ -346,7 +327,7 @@ void attention_deltanet_forward(
 
     // 4. Compute gates
     // beta = sigmoid(in_proj_b(hidden))
-    float *b_raw = aligned_calloc((size_t)num_v_heads, sizeof(float));
+    float *b_raw = calloc((size_t)num_v_heads, sizeof(float));
     snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_b", layer_idx);
     q4_proj(b_raw, hidden, model, base, num_v_heads, H);
     float *beta = calloc((size_t)num_v_heads, sizeof(float));
@@ -355,7 +336,7 @@ void attention_deltanet_forward(
     }
 
     // g = -exp(A_log) * softplus(in_proj_a(hidden) + dt_bias)
-    float *a_raw = aligned_calloc((size_t)num_v_heads, sizeof(float));
+    float *a_raw = calloc((size_t)num_v_heads, sizeof(float));
     snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_a", layer_idx);
     q4_proj(a_raw, hidden, model, base, num_v_heads, H);
 
@@ -374,7 +355,7 @@ void attention_deltanet_forward(
 
     // 5. Z gate for output gating
     int z_dim = num_v_heads * head_v_dim;
-    float *z = aligned_calloc((size_t)z_dim, sizeof(float));
+    float *z = calloc((size_t)z_dim, sizeof(float));
     snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_z", layer_idx);
     q4_proj(z, hidden, model, base, z_dim, H);
 
@@ -399,7 +380,7 @@ void attention_deltanet_forward(
     // This means 4 value heads per key head
 
     float *state = cache_dn_get(cache, dn_layer_idx);
-    float *core_out = aligned_calloc((size_t)value_dim, sizeof(float));
+    float *core_out = calloc((size_t)value_dim, sizeof(float));
 
     int v_per_k = num_v_heads / num_k_heads; // value heads per key head
     int state_size = head_k_dim * head_v_dim;
