@@ -466,29 +466,18 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
         if (ctx->use_gpu && expert_buf) {
             size_t base = (size_t)expert_idx * stride;
 
-            // Batch gate_proj + up_proj into one command buffer (1 sync instead of 2)
-            void *batch = kernel_begin_batch(ctx->metal);
-
-            // gate_proj
-            kernel_batch_q4_fma_offsets(batch, expert_buf,
-                                        base,
-                                        base + w_size,
-                                        base + w_size + s_size,
-                                        ctx->gpu_norm_out, ctx->gpu_gate_out,
-                                        (uint32_t)moe_dim, (uint32_t)H, (uint32_t)group_size);
-
-            // up_proj
-            kernel_batch_q4_fma_offsets(batch, expert_buf,
-                                        base + proj_size,
-                                        base + proj_size + w_size,
-                                        base + proj_size + w_size + s_size,
-                                        ctx->gpu_norm_out, ctx->gpu_up_out,
-                                        (uint32_t)moe_dim, (uint32_t)H, (uint32_t)group_size);
-
-            kernel_end_batch(batch);
-
-            // SiLU(gate) * up — CPU (trivial compute)
-            cpu_silu_mul(ctx->cpu_ffn_mid, ctx->cpu_gate_out, ctx->cpu_up_out, moe_dim);
+            // Fused gate+up+SwiGLU: single kernel reads input once, does both
+            // projections and SiLU(gate)*up, eliminating batch+cpu_silu_mul
+            kernel_fused_gate_up_swiglu_offsets(ctx->metal, expert_buf,
+                                                base,
+                                                base + w_size,
+                                                base + w_size + s_size,
+                                                base + proj_size,
+                                                base + proj_size + w_size,
+                                                base + proj_size + w_size + s_size,
+                                                ctx->gpu_norm_out, ctx->gpu_ffn_mid,
+                                                (uint32_t)moe_dim, (uint32_t)H,
+                                                (uint32_t)group_size);
 
             // down_proj — single dispatch
             size_t down_base = base + proj_size * 2;

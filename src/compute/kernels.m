@@ -283,6 +283,42 @@ void kernel_fused_gate_up_swiglu(MetalContext *ctx,
     [cb waitUntilCompleted];
 }
 
+// Fused gate+up+SwiGLU with offsets into a shared buffer (for mmap'd expert weights)
+void kernel_fused_gate_up_swiglu_offsets(MetalContext *ctx,
+                                          void *weight_buf,
+                                          size_t gw_off, size_t gs_off, size_t gb_off,
+                                          size_t uw_off, size_t us_off, size_t ub_off,
+                                          void *x, void *out,
+                                          uint32_t moe_dim, uint32_t K,
+                                          uint32_t group_size) {
+    id<MTLComputePipelineState> pipeline = ctx->pipelines[PIPE_FUSED_GATE_UP_SWIGLU];
+    if (!pipeline) return;
+
+    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pipeline];
+
+    id<MTLBuffer> wbuf = (__bridge id<MTLBuffer>)weight_buf;
+    [enc setBuffer:wbuf offset:(NSUInteger)gw_off atIndex:0];
+    [enc setBuffer:wbuf offset:(NSUInteger)gs_off atIndex:1];
+    [enc setBuffer:wbuf offset:(NSUInteger)gb_off atIndex:2];
+    [enc setBuffer:wbuf offset:(NSUInteger)uw_off atIndex:3];
+    [enc setBuffer:wbuf offset:(NSUInteger)us_off atIndex:4];
+    [enc setBuffer:wbuf offset:(NSUInteger)ub_off atIndex:5];
+    [enc setBuffer:(__bridge id<MTLBuffer>)x   offset:0 atIndex:6];
+    [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:7];
+    [enc setBytes:&moe_dim    length:sizeof(moe_dim)    atIndex:8];
+    [enc setBytes:&K          length:sizeof(K)          atIndex:9];
+    [enc setBytes:&group_size length:sizeof(group_size) atIndex:10];
+
+    [enc dispatchThreadgroups:MTLSizeMake(moe_dim, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+}
+
 // Fused MoE combine + shared expert + residual
 void kernel_moe_combine_residual(MetalContext *ctx,
                                   void *residual, void *shared_expert,
