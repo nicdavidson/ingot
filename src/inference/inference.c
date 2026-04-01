@@ -627,7 +627,7 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     for (int i = 0; i < H; i++) s->hidden[i] = s->residual[i] + shared_gate_val * s->expert_out[i];
 
     // Debug: track shared expert contribution
-    if (ctx->position == 0 && layer_idx >= 20 && layer_idx <= 25) {
+    if (ctx->position == 0 && (layer_idx <= 3 || (layer_idx >= 20 && layer_idx <= 25))) {
         LOG_INFO("debug L%d shared_expert: gate=%.4f out_norm=%.4f hidden_norm=%.4f",
                  layer_idx, shared_gate_val,
                  debug_l2norm(s->expert_out, H),
