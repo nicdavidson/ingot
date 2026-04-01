@@ -618,18 +618,36 @@ int inference_generate(InferenceContext *ctx,
 
     for (int t = 0; t < max_tokens; t++) {
         if (t > 0) {
-            // Run forward pass for each new token (skip first — already done in prefill)
             ctx->position = num_prompt_tokens + t - 1;
             ctx->kv_idx = 0;
             ctx->dn_idx = 0;
 
             embed_token(ctx, next_token);
 
+            uint64_t t_layer_start = 0;
+            if (t == 1) t_layer_start = timer_now_ns();
+
             for (int l = 0; l < cfg->num_hidden_layers; l++) {
                 forward_layer(ctx, l);
             }
 
+            uint64_t t_layers_done = 0;
+            if (t == 1) {
+                t_layers_done = timer_now_ns();
+                LOG_INFO("PROFILE: %d layers in %.1f ms (%.2f ms/layer)",
+                         cfg->num_hidden_layers,
+                         timer_elapsed_ms(t_layer_start, t_layers_done),
+                         timer_elapsed_ms(t_layer_start, t_layers_done) / (double)cfg->num_hidden_layers);
+            }
+
             compute_logits(ctx);
+
+            if (t == 1) {
+                uint64_t t_logits_done = timer_now_ns();
+                LOG_INFO("PROFILE: logits in %.1f ms, total %.1f ms",
+                         timer_elapsed_ms(t_layers_done, t_logits_done),
+                         timer_elapsed_ms(t_layer_start, t_logits_done));
+            }
         }
 
         // Sample next token from logits
