@@ -20,12 +20,12 @@ struct AttentionGPU {
 #ifdef PLATFORM_MACOS
     MetalContext *metal;
     void *shared_buf;       // Model's shared weight Metal buffer
-    void *gpu_x;            // Reusable input buffer [hidden_size]
+    void *gpu_x;            // Input buffer — set by caller via attention_gpu_set_input
     void *gpu_out;          // Reusable output buffer [max_proj_dim]
     float *cpu_x;           // CPU pointer into gpu_x (unified memory)
     float *cpu_out;         // CPU pointer into gpu_out (unified memory)
-    int max_x_size;         // Size of gpu_x in floats
     int max_out_size;       // Size of gpu_out in floats
+    bool owns_gpu_x;        // Whether we allocated gpu_x (vs borrowed)
 #endif
     int dummy;              // Keep struct non-empty on non-macOS
 };
@@ -62,20 +62,12 @@ AttentionGPU *attention_gpu_create(const Model *model, const ModelConfig *cfg) {
     if (z_dim > max_out) max_out = z_dim;
     if (H > max_out) max_out = H;
 
-    gpu->gpu_x = metal_alloc_buffer(gpu->metal, (size_t)H * sizeof(float));
     gpu->gpu_out = metal_alloc_buffer(gpu->metal, (size_t)max_out * sizeof(float));
 
-    if (gpu->gpu_x && gpu->gpu_out) {
-        gpu->cpu_x = metal_buffer_contents(gpu->gpu_x);
+    if (gpu->gpu_out) {
         gpu->cpu_out = metal_buffer_contents(gpu->gpu_out);
-        gpu->max_x_size = H;
         gpu->max_out_size = max_out;
-        LOG_INFO("attention: GPU buffers allocated (x=%d, out=%d)", H, max_out);
-    } else {
-        if (gpu->gpu_x) metal_free_buffer(gpu->gpu_x);
-        if (gpu->gpu_out) metal_free_buffer(gpu->gpu_out);
-        gpu->gpu_x = NULL;
-        gpu->gpu_out = NULL;
+        LOG_INFO("attention: GPU output buffer allocated (%d floats)", max_out);
     }
 #endif
 
@@ -85,10 +77,21 @@ AttentionGPU *attention_gpu_create(const Model *model, const ModelConfig *cfg) {
 void attention_gpu_free(AttentionGPU *gpu) {
     if (!gpu) return;
 #ifdef PLATFORM_MACOS
-    if (gpu->gpu_x) metal_free_buffer(gpu->gpu_x);
+    if (gpu->gpu_x && gpu->owns_gpu_x) metal_free_buffer(gpu->gpu_x);
     if (gpu->gpu_out) metal_free_buffer(gpu->gpu_out);
 #endif
     free(gpu);
+}
+
+void attention_gpu_set_input(AttentionGPU *gpu, void *gpu_buf, float *cpu_ptr) {
+    if (!gpu) return;
+#ifdef PLATFORM_MACOS
+    gpu->gpu_x = gpu_buf;
+    gpu->cpu_x = cpu_ptr;
+#else
+    (void)gpu_buf;
+    (void)cpu_ptr;
+#endif
 }
 
 // --- Helpers ---
@@ -101,13 +104,17 @@ static void q4_proj(float *out, const float *x, const Model *model,
     snprintf(bn, sizeof(bn), "%s.biases", base);
 
 #ifdef PLATFORM_MACOS
-    if (gpu && gpu->gpu_x && gpu->gpu_out && K <= gpu->max_x_size &&
-        M <= gpu->max_out_size) {
+    if (gpu && gpu->gpu_x && gpu->gpu_out && M <= gpu->max_out_size) {
         long w_off = model_get_weight_offset(model, wn);
         long s_off = model_get_weight_offset(model, sn);
         long b_off = model_get_weight_offset(model, bn);
         if (w_off >= 0 && s_off >= 0 && b_off >= 0) {
-            memcpy(gpu->cpu_x, x, (size_t)K * sizeof(float));
+            // If input pointer differs from the GPU buffer contents,
+            // we need to copy it in (e.g. for o_proj where input is
+            // head_out/core_out, not the original hidden state)
+            if (x != gpu->cpu_x) {
+                memcpy(gpu->cpu_x, x, (size_t)K * sizeof(float));
+            }
             kernel_matmul_q4_fma_offsets(gpu->metal, gpu->shared_buf,
                                          (size_t)w_off, (size_t)s_off, (size_t)b_off,
                                          gpu->gpu_x, gpu->gpu_out,

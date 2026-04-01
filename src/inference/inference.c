@@ -319,6 +319,12 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     // 2-9. Attention (SWA or DeltaNet depending on layer type)
     float *attn_result = arena_alloc(&ctx->arena, (size_t)H * sizeof(float));
 
+    // Set GPU input handle so attention can read norm_out from GPU directly
+#ifdef PLATFORM_MACOS
+    if (ctx->use_gpu)
+        attention_gpu_set_input(ctx->attn_gpu, ctx->gpu_norm_out, s->norm_out);
+#endif
+
     if (cfg->layer_types && cfg->layer_types[layer_idx] == LAYER_FULL_ATTENTION) {
         attention_swa_forward(attn_result, s->norm_out, ctx->model, cfg,
                              ctx->cache, ctx->attn_gpu,

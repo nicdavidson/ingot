@@ -13,6 +13,10 @@ typedef struct AttentionGPU AttentionGPU;
 AttentionGPU *attention_gpu_create(const Model *model, const ModelConfig *cfg);
 void attention_gpu_free(AttentionGPU *gpu);
 
+// Set the input GPU buffer handle (e.g. gpu_norm_out from InferenceContext)
+// so that q4_proj can read input directly from GPU without memcpy.
+void attention_gpu_set_input(AttentionGPU *gpu, void *gpu_buf, float *cpu_ptr);
+
 // Full (SWA) attention forward pass for a single layer.
 void attention_swa_forward(
     float       *attn_out,     // [num_heads * head_dim] output
