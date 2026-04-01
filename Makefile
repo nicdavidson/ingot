@@ -12,7 +12,7 @@ UNAME := $(shell uname -s)
 ifeq ($(UNAME),Darwin)
   # macOS: full build with Metal + Foundation
   OBJCFLAGS := -fobjc-arc
-  FRAMEWORKS := -framework Metal -framework Foundation -framework MetalKit
+  FRAMEWORKS := -framework Metal -framework Foundation -framework MetalKit -framework Accelerate
   CFLAGS += -DPLATFORM_MACOS
 
   # All source files (C + ObjC)

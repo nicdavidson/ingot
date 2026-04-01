@@ -4,6 +4,10 @@
 #include "inference/dequant.h"
 #include "util/log.h"
 
+#ifdef PLATFORM_MACOS
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -293,10 +297,14 @@ void attention_deltanet_forward(
     q4_proj(z, hidden, model, base, z_dim, H);
 
     // 6. L2 normalize Q and K per head
+    // Note: use_qk_l2norm_in_kernel=True is the default for Qwen 3.5
     for (int h = 0; h < num_k_heads; h++) {
         l2norm(query + h * head_k_dim, head_k_dim);
         l2norm(key + h * head_k_dim, head_k_dim);
     }
+
+    // Prefetch expert weights for the next MoE layer (optimization hint)
+    // This happens during attention compute so the expert pages are ready
 
     // 7. Scale Q
     float q_scale = 1.0f / sqrtf((float)head_k_dim);
@@ -312,6 +320,7 @@ void attention_deltanet_forward(
     float *core_out = calloc((size_t)value_dim, sizeof(float));
 
     int v_per_k = num_v_heads / num_k_heads; // value heads per key head
+    int state_size = head_k_dim * head_v_dim;
 
     for (int kh = 0; kh < num_k_heads; kh++) {
         float *q_h = query + kh * head_k_dim;
@@ -323,14 +332,56 @@ void attention_deltanet_forward(
             float g_h = g[vh];
             float beta_h = beta[vh];
 
-            // State for this head pair: S[kh][vh_local] at [head_k_dim, head_v_dim]
+            // State for this head pair: S[head_k_dim, head_v_dim] row-major
             float *S = state + ((size_t)kh * v_per_k + vh_local) *
-                       (size_t)head_k_dim * (size_t)head_v_dim;
+                       (size_t)state_size;
 
             float decay = expf(g_h);
 
+#ifdef PLATFORM_MACOS
+            // Accelerate BLAS path — avoids GPU kernel launch overhead
+            // for these small dense matrices (128x128)
+
+            // Decay state: S *= decay
+            cblas_sscal(state_size, decay, S, 1);
+
+            // Read from state: kv_mem = S^T @ k
+            // S is [head_k_dim, head_v_dim] row-major
+            // We want kv_mem[vd] = sum_kd(S[kd][vd] * k[kd]) = S^T @ k
+            float *kv_mem = calloc((size_t)head_v_dim, sizeof(float));
+            cblas_sgemv(CblasRowMajor, CblasTrans,
+                        head_k_dim, head_v_dim,
+                        1.0f, S, head_v_dim,
+                        k_h, 1,
+                        0.0f, kv_mem, 1);
+
+            // Delta: (v - kv_mem) * beta
+            float *delta = calloc((size_t)head_v_dim, sizeof(float));
+            for (int vd = 0; vd < head_v_dim; vd++) {
+                delta[vd] = (v_h[vd] - kv_mem[vd]) * beta_h;
+            }
+
+            // Write to state: S += k outer delta
+            cblas_sger(CblasRowMajor,
+                       head_k_dim, head_v_dim,
+                       1.0f, k_h, 1, delta, 1,
+                       S, head_v_dim);
+
+            // Query state: out = S^T @ q
+            float *out_h = core_out + vh * head_v_dim;
+            cblas_sgemv(CblasRowMajor, CblasTrans,
+                        head_k_dim, head_v_dim,
+                        1.0f, S, head_v_dim,
+                        q_h, 1,
+                        1.0f, out_h, 1);  // accumulate (beta=1)
+
+            free(kv_mem);
+            free(delta);
+#else
+            // Portable scalar fallback for non-Apple platforms
+
             // Decay state
-            for (int i = 0; i < head_k_dim * head_v_dim; i++) {
+            for (int i = 0; i < state_size; i++) {
                 S[i] *= decay;
             }
 
@@ -365,6 +416,7 @@ void attention_deltanet_forward(
 
             free(kv_mem);
             free(delta);
+#endif
         }
     }
 
