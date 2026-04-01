@@ -84,19 +84,41 @@ void attention_swa_forward(
     int kv_dim = num_kv_heads * head_dim;
     int rotary_dim = (int)((float)head_dim * cfg->rope.partial_rotary_factor);
 
+    // When attn_output_gate is enabled, q_proj is 2x wider:
+    // first half = query, second half = gate for output gating
+    int q_proj_dim = cfg->attn_output_gate ? q_dim * 2 : q_dim;
+
     char base[128];
 
-    float *q = calloc((size_t)q_dim, sizeof(float));
+    float *q_full = calloc((size_t)q_proj_dim, sizeof(float));
     float *k = calloc((size_t)kv_dim, sizeof(float));
     float *v = calloc((size_t)kv_dim, sizeof(float));
 
     // Q/K/V projections
     snprintf(base, sizeof(base), "layers.%d.self_attn.q_proj", layer_idx);
-    q4_proj(q, hidden, model, base, q_dim, H);
+    q4_proj(q_full, hidden, model, base, q_proj_dim, H);
     snprintf(base, sizeof(base), "layers.%d.self_attn.k_proj", layer_idx);
     q4_proj(k, hidden, model, base, kv_dim, H);
     snprintf(base, sizeof(base), "layers.%d.self_attn.v_proj", layer_idx);
     q4_proj(v, hidden, model, base, kv_dim, H);
+
+    // Split q_proj into query and gate
+    // q_full is laid out as [num_heads, head_dim*2] when gated
+    // We need to split each head's chunk: first head_dim = query, second = gate
+    float *q = calloc((size_t)q_dim, sizeof(float));
+    float *gate = cfg->attn_output_gate ? calloc((size_t)q_dim, sizeof(float)) : NULL;
+
+    if (cfg->attn_output_gate) {
+        for (int h = 0; h < num_heads; h++) {
+            memcpy(q + h * head_dim, q_full + h * head_dim * 2,
+                   (size_t)head_dim * sizeof(float));
+            memcpy(gate + h * head_dim, q_full + h * head_dim * 2 + head_dim,
+                   (size_t)head_dim * sizeof(float));
+        }
+    } else {
+        memcpy(q, q_full, (size_t)q_dim * sizeof(float));
+    }
+    free(q_full);
 
     // QK normalization (per-head RMSNorm)
     float *q_norm_w = calloc((size_t)head_dim, sizeof(float));
@@ -181,6 +203,14 @@ void attention_swa_forward(
         free(scores);
     }
 
+    // Apply output gate: attn_out = sigmoid(gate) * head_out
+    if (gate) {
+        // gate is [num_heads, head_dim], reshape to [q_dim] = [num_heads * head_dim]
+        for (int i = 0; i < q_dim; i++) {
+            head_out[i] *= 1.0f / (1.0f + expf(-gate[i]));
+        }
+    }
+
     // Output projection
     snprintf(base, sizeof(base), "layers.%d.self_attn.o_proj", layer_idx);
     q4_proj(attn_out, head_out, model, base, H, q_dim);
@@ -188,6 +218,7 @@ void attention_swa_forward(
     free(q); free(k); free(v);
     free(q_norm_w); free(k_norm_w);
     free(head_out);
+    free(gate);
 }
 
 // --- Gated DeltaNet (Linear Attention / SSM) ---
