@@ -16,16 +16,19 @@
 
 // --- GPU scratch for attention projections ---
 
+// Max simultaneous projection outputs for batching
+#define ATTN_GPU_SLOTS 5
+
 struct AttentionGPU {
 #ifdef PLATFORM_MACOS
     MetalContext *metal;
     void *shared_buf;       // Model's shared weight Metal buffer
     void *gpu_x;            // Input buffer — set by caller via attention_gpu_set_input
-    void *gpu_out;          // Reusable output buffer [max_proj_dim]
     float *cpu_x;           // CPU pointer into gpu_x (unified memory)
-    float *cpu_out;         // CPU pointer into gpu_out (unified memory)
-    int max_out_size;       // Size of gpu_out in floats
-    bool owns_gpu_x;        // Whether we allocated gpu_x (vs borrowed)
+    // Multiple output slots for batched projections
+    void *gpu_out[ATTN_GPU_SLOTS];
+    float *cpu_out[ATTN_GPU_SLOTS];
+    int max_out_size;       // Size of each gpu_out slot in floats
 #endif
     int dummy;              // Keep struct non-empty on non-macOS
 };
@@ -62,12 +65,25 @@ AttentionGPU *attention_gpu_create(const Model *model, const ModelConfig *cfg) {
     if (z_dim > max_out) max_out = z_dim;
     if (H > max_out) max_out = H;
 
-    gpu->gpu_out = metal_alloc_buffer(gpu->metal, (size_t)max_out * sizeof(float));
-
-    if (gpu->gpu_out) {
-        gpu->cpu_out = metal_buffer_contents(gpu->gpu_out);
+    bool all_ok = true;
+    for (int i = 0; i < ATTN_GPU_SLOTS; i++) {
+        gpu->gpu_out[i] = metal_alloc_buffer(gpu->metal, (size_t)max_out * sizeof(float));
+        if (gpu->gpu_out[i]) {
+            gpu->cpu_out[i] = metal_buffer_contents(gpu->gpu_out[i]);
+        } else {
+            all_ok = false;
+            break;
+        }
+    }
+    if (all_ok) {
         gpu->max_out_size = max_out;
-        LOG_INFO("attention: GPU output buffer allocated (%d floats)", max_out);
+        LOG_INFO("attention: GPU buffers allocated (%d slots x %d floats)",
+                 ATTN_GPU_SLOTS, max_out);
+    } else {
+        for (int i = 0; i < ATTN_GPU_SLOTS; i++) {
+            if (gpu->gpu_out[i]) metal_free_buffer(gpu->gpu_out[i]);
+            gpu->gpu_out[i] = NULL;
+        }
     }
 #endif
 
@@ -77,8 +93,10 @@ AttentionGPU *attention_gpu_create(const Model *model, const ModelConfig *cfg) {
 void attention_gpu_free(AttentionGPU *gpu) {
     if (!gpu) return;
 #ifdef PLATFORM_MACOS
-    if (gpu->gpu_x && gpu->owns_gpu_x) metal_free_buffer(gpu->gpu_x);
-    if (gpu->gpu_out) metal_free_buffer(gpu->gpu_out);
+    for (int i = 0; i < ATTN_GPU_SLOTS; i++) {
+        if (gpu->gpu_out[i]) metal_free_buffer(gpu->gpu_out[i]);
+    }
+    // gpu_x is borrowed, not owned
 #endif
     free(gpu);
 }
@@ -96,6 +114,57 @@ void attention_gpu_set_input(AttentionGPU *gpu, void *gpu_buf, float *cpu_ptr) {
 
 // --- Helpers ---
 
+// Batch multiple projections sharing the same input into one command buffer.
+// bases[i] is the weight name prefix, outs[i] is where result goes, Ms[i] is output dim.
+// All read from gpu->gpu_x, write to gpu_out[0..n-1], then memcpy to outs[i].
+#ifdef PLATFORM_MACOS
+static bool q4_proj_batch(float *outs[], const float *x, const Model *model,
+                          AttentionGPU *gpu, const char *bases[], int Ms[], int n,
+                          int K) {
+    if (!gpu || !gpu->gpu_x || !gpu->gpu_out[0] || n > ATTN_GPU_SLOTS) return false;
+
+    // Verify all output dims fit and all weights exist
+    for (int i = 0; i < n; i++) {
+        if (Ms[i] > gpu->max_out_size) return false;
+    }
+
+    // Build weight name lookup
+    char wn[128], sn[128], bn[128];
+    void *batch = kernel_begin_batch(gpu->metal);
+
+    if (x != gpu->cpu_x) {
+        memcpy(gpu->cpu_x, x, (size_t)K * sizeof(float));
+    }
+
+    for (int i = 0; i < n; i++) {
+        snprintf(wn, sizeof(wn), "%s.weight", bases[i]);
+        snprintf(sn, sizeof(sn), "%s.scales", bases[i]);
+        snprintf(bn, sizeof(bn), "%s.biases", bases[i]);
+
+        long w_off = model_get_weight_offset(model, wn);
+        long s_off = model_get_weight_offset(model, sn);
+        long b_off = model_get_weight_offset(model, bn);
+        if (w_off < 0 || s_off < 0 || b_off < 0) {
+            kernel_end_batch(batch);
+            return false;
+        }
+
+        kernel_batch_q4_fma_offsets(batch, gpu->shared_buf,
+                                     (size_t)w_off, (size_t)s_off, (size_t)b_off,
+                                     gpu->gpu_x, gpu->gpu_out[i],
+                                     (uint32_t)Ms[i], (uint32_t)K, 64);
+    }
+
+    kernel_end_batch(batch);  // Single commit for all projections
+
+    // Copy results from unified memory
+    for (int i = 0; i < n; i++) {
+        memcpy(outs[i], gpu->cpu_out[i], (size_t)Ms[i] * sizeof(float));
+    }
+    return true;
+}
+#endif
+
 static void q4_proj(float *out, const float *x, const Model *model,
                     AttentionGPU *gpu, const char *base, int M, int K) {
     char wn[128], sn[128], bn[128];
@@ -104,22 +173,19 @@ static void q4_proj(float *out, const float *x, const Model *model,
     snprintf(bn, sizeof(bn), "%s.biases", base);
 
 #ifdef PLATFORM_MACOS
-    if (gpu && gpu->gpu_x && gpu->gpu_out && M <= gpu->max_out_size) {
+    if (gpu && gpu->gpu_x && gpu->gpu_out[0] && M <= gpu->max_out_size) {
         long w_off = model_get_weight_offset(model, wn);
         long s_off = model_get_weight_offset(model, sn);
         long b_off = model_get_weight_offset(model, bn);
         if (w_off >= 0 && s_off >= 0 && b_off >= 0) {
-            // If input pointer differs from the GPU buffer contents,
-            // we need to copy it in (e.g. for o_proj where input is
-            // head_out/core_out, not the original hidden state)
             if (x != gpu->cpu_x) {
                 memcpy(gpu->cpu_x, x, (size_t)K * sizeof(float));
             }
             kernel_matmul_q4_fma_offsets(gpu->metal, gpu->shared_buf,
                                          (size_t)w_off, (size_t)s_off, (size_t)b_off,
-                                         gpu->gpu_x, gpu->gpu_out,
+                                         gpu->gpu_x, gpu->gpu_out[0],
                                          (uint32_t)M, (uint32_t)K, 64);
-            memcpy(out, gpu->cpu_out, (size_t)M * sizeof(float));
+            memcpy(out, gpu->cpu_out[0], (size_t)M * sizeof(float));
             return;
         }
     }
@@ -199,13 +265,28 @@ void attention_swa_forward(
     float *k = calloc((size_t)kv_dim, sizeof(float));
     float *v = calloc((size_t)kv_dim, sizeof(float));
 
-    // Q/K/V projections
-    snprintf(base, sizeof(base), "layers.%d.self_attn.q_proj", layer_idx);
-    q4_proj(q_full, hidden, model, gpu, base, q_proj_dim, H);
-    snprintf(base, sizeof(base), "layers.%d.self_attn.k_proj", layer_idx);
-    q4_proj(k, hidden, model, gpu, base, kv_dim, H);
-    snprintf(base, sizeof(base), "layers.%d.self_attn.v_proj", layer_idx);
-    q4_proj(v, hidden, model, gpu, base, kv_dim, H);
+    // Q/K/V projections — batch into single GPU commit
+    char base_q[128], base_k[128], base_v[128];
+    snprintf(base_q, sizeof(base_q), "layers.%d.self_attn.q_proj", layer_idx);
+    snprintf(base_k, sizeof(base_k), "layers.%d.self_attn.k_proj", layer_idx);
+    snprintf(base_v, sizeof(base_v), "layers.%d.self_attn.v_proj", layer_idx);
+
+#ifdef PLATFORM_MACOS
+    {
+        float *batch_outs[] = { q_full, k, v };
+        const char *batch_bases[] = { base_q, base_k, base_v };
+        int batch_ms[] = { q_proj_dim, kv_dim, kv_dim };
+        if (!q4_proj_batch(batch_outs, hidden, model, gpu, batch_bases, batch_ms, 3, H)) {
+            q4_proj(q_full, hidden, model, gpu, base_q, q_proj_dim, H);
+            q4_proj(k, hidden, model, gpu, base_k, kv_dim, H);
+            q4_proj(v, hidden, model, gpu, base_v, kv_dim, H);
+        }
+    }
+#else
+    q4_proj(q_full, hidden, model, gpu, base_q, q_proj_dim, H);
+    q4_proj(k, hidden, model, gpu, base_k, kv_dim, H);
+    q4_proj(v, hidden, model, gpu, base_v, kv_dim, H);
+#endif
 
     // Split q_proj into query and gate
     // q_full is laid out as [num_heads, head_dim*2] when gated
@@ -356,63 +437,76 @@ void attention_deltanet_forward(
 
     char base[128], wname[128];
 
-    // 1. QKV projection: hidden → [key_dim + key_dim + value_dim]
+    // 1-5. Batch all projections from hidden (qkv, b, a, z) in one GPU commit
     float *qkv = calloc((size_t)conv_dim, sizeof(float));
-    snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_qkv", layer_idx);
-    q4_proj(qkv, hidden, model, gpu, base, conv_dim, H);
+    float *b_raw = calloc((size_t)num_v_heads, sizeof(float));
+    float *a_raw = calloc((size_t)num_v_heads, sizeof(float));
+    int z_dim = num_v_heads * head_v_dim;
+    float *z = calloc((size_t)z_dim, sizeof(float));
+
+    char base_qkv[128], base_b[128], base_a[128], base_z[128];
+    snprintf(base_qkv, sizeof(base_qkv), "layers.%d.linear_attn.in_proj_qkv", layer_idx);
+    snprintf(base_b, sizeof(base_b), "layers.%d.linear_attn.in_proj_b", layer_idx);
+    snprintf(base_a, sizeof(base_a), "layers.%d.linear_attn.in_proj_a", layer_idx);
+    snprintf(base_z, sizeof(base_z), "layers.%d.linear_attn.in_proj_z", layer_idx);
+
+#ifdef PLATFORM_MACOS
+    {
+        float *batch_outs[] = { qkv, b_raw, a_raw, z };
+        const char *batch_bases[] = { base_qkv, base_b, base_a, base_z };
+        int batch_ms[] = { conv_dim, num_v_heads, num_v_heads, z_dim };
+        if (!q4_proj_batch(batch_outs, hidden, model, gpu, batch_bases, batch_ms, 4, H)) {
+            // Fallback to individual calls
+            q4_proj(qkv, hidden, model, gpu, base_qkv, conv_dim, H);
+            q4_proj(b_raw, hidden, model, gpu, base_b, num_v_heads, H);
+            q4_proj(a_raw, hidden, model, gpu, base_a, num_v_heads, H);
+            q4_proj(z, hidden, model, gpu, base_z, z_dim, H);
+        }
+    }
+#else
+    q4_proj(qkv, hidden, model, gpu, base_qkv, conv_dim, H);
+    q4_proj(b_raw, hidden, model, gpu, base_b, num_v_heads, H);
+    q4_proj(a_raw, hidden, model, gpu, base_a, num_v_heads, H);
+    q4_proj(z, hidden, model, gpu, base_z, z_dim, H);
+#endif
 
     // 2. Causal conv1d with state tracking
-    // Conv1d weight is [conv_dim, kernel_size, 1] BF16 (depthwise)
-    // For single-token: shift conv_state left, append new qkv, convolve, SiLU
-    int kernel_size = cfg->linear_attn.linear_conv_kernel_dim; // typically 4
+    int kernel_size = cfg->linear_attn.linear_conv_kernel_dim;
     float *conv_weight = calloc((size_t)conv_dim * (size_t)kernel_size, sizeof(float));
     snprintf(wname, sizeof(wname), "layers.%d.linear_attn.conv1d.weight", layer_idx);
     load_bf16(conv_weight, model, wname, conv_dim * kernel_size);
 
     float *conv_state = cache_dn_conv_get(cache, dn_layer_idx);
-    int state_len = kernel_size - 1; // conv_state holds last (kernel_size-1) values
+    int state_len = kernel_size - 1;
 
-    // For each channel: convolve over [conv_state..., current_qkv]
     for (int c = 0; c < conv_dim; c++) {
         float *cs = conv_state + c * state_len;
         float *cw = conv_weight + c * kernel_size;
 
-        // Convolution: sum over kernel window
         float sum = 0.0f;
         for (int k = 0; k < state_len; k++) {
             sum += cs[k] * cw[k];
         }
-        sum += qkv[c] * cw[state_len]; // current value × last kernel weight
+        sum += qkv[c] * cw[state_len];
 
-        // Shift state: drop oldest, append current
         for (int k = 0; k < state_len - 1; k++) {
             cs[k] = cs[k + 1];
         }
         if (state_len > 0) cs[state_len - 1] = qkv[c];
 
-        // SiLU activation
         qkv[c] = sum / (1.0f + expf(-sum));
     }
 
     // 3. Split QKV
-    float *query = qkv;                          // [key_dim]
-    float *key = qkv + key_dim;                  // [key_dim]
-    float *value = qkv + key_dim * 2;            // [value_dim]
+    float *query = qkv;
+    float *key = qkv + key_dim;
+    float *value = qkv + key_dim * 2;
 
     // 4. Compute gates
-    // beta = sigmoid(in_proj_b(hidden))
-    float *b_raw = calloc((size_t)num_v_heads, sizeof(float));
-    snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_b", layer_idx);
-    q4_proj(b_raw, hidden, model, gpu, base, num_v_heads, H);
     float *beta = calloc((size_t)num_v_heads, sizeof(float));
     for (int i = 0; i < num_v_heads; i++) {
-        beta[i] = 1.0f / (1.0f + expf(-b_raw[i])); // sigmoid
+        beta[i] = 1.0f / (1.0f + expf(-b_raw[i]));
     }
-
-    // g = -exp(A_log) * softplus(in_proj_a(hidden) + dt_bias)
-    float *a_raw = calloc((size_t)num_v_heads, sizeof(float));
-    snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_a", layer_idx);
-    q4_proj(a_raw, hidden, model, gpu, base, num_v_heads, H);
 
     float *A_log = calloc((size_t)num_v_heads, sizeof(float));
     snprintf(wname, sizeof(wname), "layers.%d.linear_attn.A_log", layer_idx);
@@ -426,12 +520,6 @@ void attention_deltanet_forward(
     for (int i = 0; i < num_v_heads; i++) {
         g[i] = -expf(A_log[i]) * softplus(a_raw[i] + dt_bias_w[i]);
     }
-
-    // 5. Z gate for output gating
-    int z_dim = num_v_heads * head_v_dim;
-    float *z = calloc((size_t)z_dim, sizeof(float));
-    snprintf(base, sizeof(base), "layers.%d.linear_attn.in_proj_z", layer_idx);
-    q4_proj(z, hidden, model, gpu, base, z_dim, H);
 
     // 6. L2 normalize Q and K per head
     // Note: use_qk_l2norm_in_kernel=True is the default for Qwen 3.5
