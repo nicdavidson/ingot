@@ -479,8 +479,8 @@ int inference_generate(InferenceContext *ctx,
         for (int l = 0; l < cfg->num_hidden_layers; l++) {
             forward_layer(ctx, l);
 
-            // Debug: dump hidden after first 2 layers for first token
-            if (i == 0 && l < 2) {
+            // Debug: dump hidden after layers for first token
+            if (i == 0 && (l < 2 || l == cfg->num_hidden_layers - 1)) {
                 float sum2 = 0.0f;
                 for (int d = 0; d < cfg->hidden_size; d++)
                     sum2 += ctx->scratch.hidden[d] * ctx->scratch.hidden[d];
@@ -513,6 +513,20 @@ int inference_generate(InferenceContext *ctx,
 
         // Project to vocab logits
         compute_logits(ctx);
+
+        // Debug: dump logits stats for first generation step
+        if (t == 0) {
+            float lmin = ctx->scratch.logits[0], lmax = lmin, lsum = 0;
+            int argmax = 0;
+            for (int d = 0; d < cfg->vocab_size; d++) {
+                float v = ctx->scratch.logits[d];
+                if (v < lmin) lmin = v;
+                if (v > lmax) { lmax = v; argmax = d; }
+                lsum += v;
+            }
+            LOG_INFO("DEBUG logits: min=%.4f max=%.4f mean=%.6f argmax=%d",
+                     lmin, lmax, lsum / (float)cfg->vocab_size, argmax);
+        }
 
         // Sample next token from logits
         next_token = sampler_sample(sampler, ctx->scratch.logits, cfg->vocab_size);
