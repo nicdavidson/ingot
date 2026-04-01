@@ -39,6 +39,11 @@ struct Model {
 #endif
 };
 
+// Compare function for sorting file names
+static int cmp_strings(const void *a, const void *b) {
+    return strcmp(*(const char **)a, *(const char **)b);
+}
+
 // Scan for expert layer files (layer_00.bin, layer_01.bin, etc.)
 static int load_expert_files(Model *model, const char *model_dir) {
     char expert_dir[1024];
@@ -50,47 +55,55 @@ static int load_expert_files(Model *model, const char *model_dir) {
         return 0;
     }
 
+    // Collect filenames first, then sort to ensure layer_00 < layer_01 < ...
+    // readdir() returns arbitrary filesystem order which breaks layer indexing.
     int count = 0;
+    int name_cap = 128;
+    char **names = calloc((size_t)name_cap, sizeof(char *));
     struct dirent *ent;
     while ((ent = readdir(dir)) != NULL) {
         if (strstr(ent->d_name, "layer_") && strstr(ent->d_name, ".bin")) {
+            if (count >= name_cap) {
+                name_cap *= 2;
+                names = realloc(names, (size_t)name_cap * sizeof(char *));
+            }
+            names[count] = strdup(ent->d_name);
             count++;
         }
     }
     closedir(dir);
 
-    if (count == 0) return 0;
+    if (count == 0) { free(names); return 0; }
+
+    // Sort lexicographically — layer_00.bin < layer_01.bin < ... < layer_59.bin
+    qsort(names, (size_t)count, sizeof(char *), cmp_strings);
 
     model->expert_data = calloc((size_t)count, sizeof(void *));
     model->expert_sizes = calloc((size_t)count, sizeof(size_t));
     model->expert_fds = calloc((size_t)count, sizeof(int));
     model->num_expert_files = count;
 
-    // Record pool index before adding expert files
     int pool_base = mmap_pool_count(model->pool);
 
-    // Reopen and map each file
-    dir = opendir(expert_dir);
     int idx = 0;
-    while ((ent = readdir(dir)) != NULL && idx < count) {
-        if (strstr(ent->d_name, "layer_") && strstr(ent->d_name, ".bin")) {
-            char path[2048];
-            snprintf(path, sizeof(path), "%s/%s", expert_dir, ent->d_name);
+    for (int i = 0; i < count; i++) {
+        char path[2048];
+        snprintf(path, sizeof(path), "%s/%s", expert_dir, names[i]);
 
-            size_t size;
-            void *data = mmap_pool_add(model->pool, path, &size);
-            if (data) {
-                model->expert_data[idx] = data;
-                model->expert_sizes[idx] = size;
-                model->expert_fds[idx] = mmap_pool_get_fd(model->pool,
-                                                            pool_base + idx);
-                idx++;
-            }
+        size_t size;
+        void *data = mmap_pool_add(model->pool, path, &size);
+        if (data) {
+            model->expert_data[idx] = data;
+            model->expert_sizes[idx] = size;
+            model->expert_fds[idx] = mmap_pool_get_fd(model->pool,
+                                                        pool_base + idx);
+            idx++;
         }
+        free(names[i]);
     }
-    closedir(dir);
+    free(names);
 
-    LOG_INFO("model: mapped %d expert layer files", idx);
+    LOG_INFO("model: mapped %d expert layer files (sorted)", idx);
     return idx;
 }
 
