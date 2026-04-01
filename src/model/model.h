@@ -50,4 +50,12 @@ void *model_get_expert_metal_buf(const Model *model, int layer_idx);
 const void *model_get_expert(const Model *model, int layer_idx, int expert_idx,
                              size_t *out_stride);
 
+// Get the file descriptor for a layer's expert file (for pread-based I/O).
+// Returns -1 if not available.
+int model_get_expert_fd(const Model *model, int layer_idx);
+
+// Get expert stride (bytes per expert) for a layer.
+// Returns 0 if not found.
+size_t model_get_expert_stride(const Model *model, int layer_idx);
+
 #endif

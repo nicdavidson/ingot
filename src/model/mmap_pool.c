@@ -81,6 +81,16 @@ void mmap_pool_prefetch(void *addr, size_t len) {
     madvise(addr, len, MADV_WILLNEED);
 }
 
+int mmap_pool_get_fd(MmapPool *pool, int index) {
+    if (!pool || index < 0 || index >= pool->count) return -1;
+    return pool->files[index].fd;
+}
+
+int mmap_pool_count(MmapPool *pool) {
+    if (!pool) return 0;
+    return pool->count;
+}
+
 void mmap_pool_free(MmapPool *pool) {
     if (!pool) return;
     for (int i = 0; i < pool->count; i++) {

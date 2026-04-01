@@ -14,6 +14,7 @@
 #ifdef PLATFORM_MACOS
 #include "compute/kernels.h"
 #include "compute/metal_context.h"
+#include "model/expert_io.h"
 #endif
 
 #include <alloca.h>
@@ -71,6 +72,11 @@ struct InferenceContext {
     void           *gpu_result_slots[16];
     float          *cpu_ffn_mid_slots[16];
     float          *cpu_result_slots[16];
+    // Expert staging buffers — pread directly into Metal unified memory
+    void           *gpu_expert_staging[16];  // Metal buffer handles
+    void           *cpu_expert_staging[16];  // CPU pointers into staging
+    size_t          expert_staging_size;      // bytes per staging buffer
+    ExpertIO       *expert_io;               // GCD parallel pread subsystem
     bool            use_gpu;
 #endif
 };
@@ -178,6 +184,30 @@ InferenceContext *inference_create(Model *model) {
             if (slots_ok) {
                 ctx->num_expert_slots = K_max;
             }
+
+            // Expert staging buffers — pread directly into Metal unified memory
+            // Each staging buffer holds one full expert's weight data
+            size_t max_stride = model_get_expert_stride(model, 0);
+            if (max_stride > 0) {
+                bool staging_ok = true;
+                for (int i = 0; i < K_max; i++) {
+                    ctx->gpu_expert_staging[i] = metal_alloc_buffer(ctx->metal, max_stride);
+                    if (ctx->gpu_expert_staging[i]) {
+                        ctx->cpu_expert_staging[i] = metal_buffer_contents(
+                            ctx->gpu_expert_staging[i]);
+                    } else {
+                        staging_ok = false;
+                        break;
+                    }
+                }
+                if (staging_ok) {
+                    ctx->expert_staging_size = max_stride;
+                    ctx->expert_io = expert_io_create(K_max);
+                    LOG_INFO("inference: expert staging allocated (%d x %zu MB)",
+                             K_max, max_stride / (1024 * 1024));
+                }
+            }
+
             LOG_INFO("inference: GPU acceleration enabled (%d expert slots)", ctx->num_expert_slots);
         }
     }
@@ -424,18 +454,40 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
         for (int k = 0; k < K_active; k++) top_weights[k] /= wsum;
     }
 
-    // Prefetch selected expert weight pages — gives the OS a head start
-    // paging in expert data while the shared expert FFN runs on GPU
-    for (int k = 0; k < K_active; k++) {
-        size_t stride;
-        const void *expert_data = model_get_expert(ctx->model, layer_idx,
-                                                    top_indices[k], &stride);
-        if (expert_data) {
-            mmap_pool_prefetch((void *)expert_data, stride);
+    // Issue parallel pread() for selected experts into staging buffers.
+    // This runs concurrently with the shared expert FFN below.
+    size_t expert_stride = model_get_expert_stride(ctx->model, layer_idx);
+    int expert_fd = model_get_expert_fd(ctx->model, layer_idx);
+#ifdef PLATFORM_MACOS
+    bool pread_experts = false;
+    if (ctx->expert_io && expert_fd >= 0 && expert_stride > 0 &&
+        K_active <= ctx->num_expert_slots &&
+        expert_stride <= ctx->expert_staging_size) {
+        size_t offsets[16];
+        size_t sizes[16];
+        void  *dests[16];
+        for (int k = 0; k < K_active; k++) {
+            offsets[k] = (size_t)top_indices[k] * expert_stride;
+            sizes[k]   = expert_stride;
+            dests[k]   = ctx->cpu_expert_staging[k];
+        }
+        expert_io_fetch(ctx->expert_io, expert_fd, offsets, sizes, dests, K_active);
+        pread_experts = true;
+    } else
+#endif
+    {
+        // Fallback: madvise prefetch for mmap path
+        for (int k = 0; k < K_active; k++) {
+            size_t stride;
+            const void *expert_data = model_get_expert(ctx->model, layer_idx,
+                                                        top_indices[k], &stride);
+            if (expert_data) {
+                mmap_pool_prefetch((void *)expert_data, stride);
+            }
         }
     }
 
-    // 13. Shared expert FFN
+    // 13. Shared expert FFN (runs while pread I/O is in flight)
     int moe_dim = cfg->shared_expert_intermediate_size;
     float *gate_out = arena_alloc(&ctx->arena, (size_t)moe_dim * sizeof(float));
     float *up_out   = arena_alloc(&ctx->arena, (size_t)moe_dim * sizeof(float));
@@ -541,37 +593,35 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     size_t ds_size = (size_t)H * (size_t)down_groups * 2;
 
 #ifdef PLATFORM_MACOS
-    // Batched GPU path: encode ALL routed experts into one command buffer
-    void *expert_buf = model_get_expert_metal_buf(ctx->model, layer_idx);
-    if (ctx->use_gpu && expert_buf && K_active <= ctx->num_expert_slots) {
+    if (ctx->use_gpu && K_active <= ctx->num_expert_slots && pread_experts) {
+        // pread-based path: expert data is in staging buffers (Metal unified memory)
+        // Wait for parallel pread() to complete
+        expert_io_wait(ctx->expert_io);
+
         void *batch = kernel_begin_batch(ctx->metal);
         int batch_count = 0;
 
         for (int k = 0; k < K_active; k++) {
-            int expert_idx = top_indices[k];
-            size_t stride;
-            const void *expert_data = model_get_expert(ctx->model, layer_idx,
-                                                        expert_idx, &stride);
-            if (!expert_data) continue;
+            // Offsets within the staging buffer (expert data starts at 0)
+            size_t down_base = proj_size * 2;
 
-            size_t base = (size_t)expert_idx * stride;
-            size_t down_base = base + proj_size * 2;
-
-            // Fused gate+up+SwiGLU → per-expert ffn_mid slot
-            kernel_batch_fused_gate_up_swiglu_offsets(batch, expert_buf,
-                                                      base,
-                                                      base + w_size,
-                                                      base + w_size + s_size,
-                                                      base + proj_size,
-                                                      base + proj_size + w_size,
-                                                      base + proj_size + w_size + s_size,
+            // Fused gate+up+SwiGLU using staging buffer as weight source
+            kernel_batch_fused_gate_up_swiglu_offsets(batch,
+                                                      ctx->gpu_expert_staging[k],
+                                                      0,
+                                                      w_size,
+                                                      w_size + s_size,
+                                                      proj_size,
+                                                      proj_size + w_size,
+                                                      proj_size + w_size + s_size,
                                                       ctx->gpu_norm_out,
                                                       ctx->gpu_ffn_mid_slots[k],
                                                       (uint32_t)moe_dim, (uint32_t)H,
                                                       (uint32_t)group_size);
 
-            // down_proj → per-expert result slot
-            kernel_batch_q4_fma_offsets(batch, expert_buf,
+            // down_proj using staging buffer
+            kernel_batch_q4_fma_offsets(batch,
+                                        ctx->gpu_expert_staging[k],
                                         down_base,
                                         down_base + dw_size,
                                         down_base + dw_size + ds_size,
@@ -582,7 +632,7 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
             batch_count++;
         }
 
-        kernel_end_batch(batch);  // Single commit for ALL experts
+        kernel_end_batch(batch);
 
         // Accumulate weighted results from unified memory
         for (int k = 0; k < batch_count; k++) {
@@ -590,6 +640,56 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
             float *result = ctx->cpu_result_slots[k];
             for (int i = 0; i < H; i++) {
                 s->hidden[i] += weight * result[i];
+            }
+        }
+    } else if (ctx->use_gpu && K_active <= ctx->num_expert_slots) {
+        // mmap-based GPU path (fallback when pread not available)
+        void *expert_buf = model_get_expert_metal_buf(ctx->model, layer_idx);
+        if (expert_buf) {
+            void *batch = kernel_begin_batch(ctx->metal);
+            int batch_count = 0;
+
+            for (int k = 0; k < K_active; k++) {
+                int expert_idx = top_indices[k];
+                size_t stride;
+                const void *expert_data = model_get_expert(ctx->model, layer_idx,
+                                                            expert_idx, &stride);
+                if (!expert_data) continue;
+
+                size_t base = (size_t)expert_idx * stride;
+                size_t down_base = base + proj_size * 2;
+
+                kernel_batch_fused_gate_up_swiglu_offsets(batch, expert_buf,
+                                                          base,
+                                                          base + w_size,
+                                                          base + w_size + s_size,
+                                                          base + proj_size,
+                                                          base + proj_size + w_size,
+                                                          base + proj_size + w_size + s_size,
+                                                          ctx->gpu_norm_out,
+                                                          ctx->gpu_ffn_mid_slots[k],
+                                                          (uint32_t)moe_dim, (uint32_t)H,
+                                                          (uint32_t)group_size);
+
+                kernel_batch_q4_fma_offsets(batch, expert_buf,
+                                            down_base,
+                                            down_base + dw_size,
+                                            down_base + dw_size + ds_size,
+                                            ctx->gpu_ffn_mid_slots[k],
+                                            ctx->gpu_result_slots[k],
+                                            (uint32_t)H, (uint32_t)moe_dim,
+                                            (uint32_t)group_size);
+                batch_count++;
+            }
+
+            kernel_end_batch(batch);
+
+            for (int k = 0; k < batch_count; k++) {
+                float weight = top_weights[k];
+                float *result = ctx->cpu_result_slots[k];
+                for (int i = 0; i < H; i++) {
+                    s->hidden[i] += weight * result[i];
+                }
             }
         }
     } else
@@ -808,6 +908,13 @@ void inference_free(InferenceContext *ctx) {
         for (int i = 0; i < ctx->num_expert_slots; i++) {
             metal_free_buffer(ctx->gpu_ffn_mid_slots[i]);
             metal_free_buffer(ctx->gpu_result_slots[i]);
+        }
+        if (ctx->expert_io) {
+            for (int i = 0; i < ctx->num_expert_slots; i++) {
+                if (ctx->gpu_expert_staging[i])
+                    metal_free_buffer(ctx->gpu_expert_staging[i]);
+            }
+            expert_io_free(ctx->expert_io);
         }
     }
 #endif

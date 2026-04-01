@@ -29,6 +29,7 @@ struct Model {
     // Expert files: one mmap per layer
     void        **expert_data;    // [num_layers]
     size_t       *expert_sizes;   // [num_layers]
+    int          *expert_fds;     // [num_layers] file descriptors for pread
     int           num_expert_files;
 
 #ifdef PLATFORM_MACOS
@@ -62,7 +63,11 @@ static int load_expert_files(Model *model, const char *model_dir) {
 
     model->expert_data = calloc((size_t)count, sizeof(void *));
     model->expert_sizes = calloc((size_t)count, sizeof(size_t));
+    model->expert_fds = calloc((size_t)count, sizeof(int));
     model->num_expert_files = count;
+
+    // Record pool index before adding expert files
+    int pool_base = mmap_pool_count(model->pool);
 
     // Reopen and map each file
     dir = opendir(expert_dir);
@@ -77,6 +82,8 @@ static int load_expert_files(Model *model, const char *model_dir) {
             if (data) {
                 model->expert_data[idx] = data;
                 model->expert_sizes[idx] = size;
+                model->expert_fds[idx] = mmap_pool_get_fd(model->pool,
+                                                            pool_base + idx);
                 idx++;
             }
         }
@@ -206,6 +213,7 @@ void model_free(Model *model) {
     mmap_pool_free(model->pool);
     free(model->expert_data);
     free(model->expert_sizes);
+    free(model->expert_fds);
     weight_index_free(&model->weight_idx);
     free(model);
 }
@@ -285,4 +293,19 @@ const void *model_get_expert(const Model *model, int layer_idx, int expert_idx,
 
     if (out_stride) *out_stride = e->expert_stride;
     return (const char *)data + (size_t)expert_idx * e->expert_stride;
+}
+
+int model_get_expert_fd(const Model *model, int layer_idx) {
+    if (!model->expert_fds || layer_idx < 0 ||
+        layer_idx >= model->num_expert_files)
+        return -1;
+    return model->expert_fds[layer_idx];
+}
+
+size_t model_get_expert_stride(const Model *model, int layer_idx) {
+    char name[64];
+    snprintf(name, sizeof(name), "layers.%d.experts", layer_idx);
+    const WeightEntry *e = weight_index_find(&model->weight_idx, name);
+    if (!e) return 0;
+    return e->expert_stride;
 }
