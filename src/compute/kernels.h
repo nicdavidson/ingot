@@ -31,6 +31,15 @@ void kernel_matmul_q4_fma_offsets(MetalContext *ctx,
                                    void *x, void *out,
                                    uint32_t M, uint32_t K, uint32_t group_size);
 
+// Batched command buffer API — encode multiple matmuls before committing
+void *kernel_begin_batch(MetalContext *ctx);
+void kernel_batch_q4_fma_offsets(void *batch,
+                                  void *weight_buf,
+                                  size_t w_offset, size_t s_offset, size_t b_offset,
+                                  void *x, void *out,
+                                  uint32_t M, uint32_t K, uint32_t group_size);
+void kernel_end_batch(void *batch);
+
 // BF16 matmul with threadgroup optimization
 void kernel_matmul_bf16(MetalContext *ctx,
                         void *A, void *x, void *out,

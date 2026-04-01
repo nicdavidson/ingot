@@ -454,43 +454,38 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
 #ifdef PLATFORM_MACOS
         void *expert_buf = model_get_expert_metal_buf(ctx->model, layer_idx);
         if (ctx->use_gpu && expert_buf) {
-            // GPU path: dispatch matmuls using expert Metal buffer + offsets
             size_t base = (size_t)expert_idx * stride;
 
-            // gate_proj offsets
-            size_t gw_off = base;
-            size_t gs_off = base + w_size;
-            size_t gb_off = base + w_size + s_size;
+            // Batch gate_proj + up_proj into one command buffer (1 sync instead of 2)
+            void *batch = kernel_begin_batch(ctx->metal);
 
-            // up_proj offsets
-            size_t uw_off = base + proj_size;
-            size_t us_off = base + proj_size + w_size;
-            size_t ub_off = base + proj_size + w_size + s_size;
+            // gate_proj
+            kernel_batch_q4_fma_offsets(batch, expert_buf,
+                                        base,
+                                        base + w_size,
+                                        base + w_size + s_size,
+                                        ctx->gpu_norm_out, ctx->gpu_gate_out,
+                                        (uint32_t)moe_dim, (uint32_t)H, (uint32_t)group_size);
 
-            // gate_proj → gpu_gate_out
-            kernel_matmul_q4_fma_offsets(ctx->metal, expert_buf,
-                                         gw_off, gs_off, gb_off,
-                                         ctx->gpu_norm_out, ctx->gpu_gate_out,
-                                         (uint32_t)moe_dim, (uint32_t)H, (uint32_t)group_size);
+            // up_proj
+            kernel_batch_q4_fma_offsets(batch, expert_buf,
+                                        base + proj_size,
+                                        base + proj_size + w_size,
+                                        base + proj_size + w_size + s_size,
+                                        ctx->gpu_norm_out, ctx->gpu_up_out,
+                                        (uint32_t)moe_dim, (uint32_t)H, (uint32_t)group_size);
 
-            // up_proj → gpu_up_out
-            kernel_matmul_q4_fma_offsets(ctx->metal, expert_buf,
-                                         uw_off, us_off, ub_off,
-                                         ctx->gpu_norm_out, ctx->gpu_up_out,
-                                         (uint32_t)moe_dim, (uint32_t)H, (uint32_t)group_size);
+            kernel_end_batch(batch);
 
-            // SiLU(gate) * up — CPU for now (small op)
+            // SiLU(gate) * up — CPU (trivial compute)
             cpu_silu_mul(ctx->cpu_ffn_mid, ctx->cpu_gate_out, ctx->cpu_up_out, moe_dim);
 
-            // down_proj offsets
+            // down_proj — single dispatch
             size_t down_base = base + proj_size * 2;
-            size_t dw_off = down_base;
-            size_t ds_off = down_base + dw_size;
-            size_t db_off = down_base + dw_size + ds_size;
-
-            // down_proj → gpu_expert_result
             kernel_matmul_q4_fma_offsets(ctx->metal, expert_buf,
-                                         dw_off, ds_off, db_off,
+                                         down_base,
+                                         down_base + dw_size,
+                                         down_base + dw_size + ds_size,
                                          ctx->gpu_ffn_mid, ctx->gpu_expert_result,
                                          (uint32_t)H, (uint32_t)moe_dim, (uint32_t)group_size);
 

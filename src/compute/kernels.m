@@ -173,6 +173,57 @@ void kernel_matmul_q4_fma_offsets(MetalContext *ctx,
     [cb waitUntilCompleted];
 }
 
+// --- Batched command buffer API ---
+// Encodes multiple matmuls into a single command buffer, then commits once.
+// Eliminates per-dispatch commit+waitUntilCompleted overhead.
+
+typedef struct {
+    MetalContext *ctx;
+    id<MTLCommandBuffer> cb;
+} BatchContext;
+
+void *kernel_begin_batch(MetalContext *ctx) {
+    BatchContext *batch = calloc(1, sizeof(BatchContext));
+    batch->ctx = ctx;
+    batch->cb = [ctx->queue commandBuffer];
+    return batch;
+}
+
+void kernel_batch_q4_fma_offsets(void *batch_ptr,
+                                  void *weight_buf,
+                                  size_t w_offset, size_t s_offset, size_t b_offset,
+                                  void *x, void *out,
+                                  uint32_t M, uint32_t K, uint32_t group_size) {
+    BatchContext *batch = batch_ptr;
+    id<MTLComputePipelineState> pipeline = batch->ctx->pipelines[PIPE_MATMUL_Q4_FMA];
+    if (!pipeline) return;
+
+    id<MTLComputeCommandEncoder> enc = [batch->cb computeCommandEncoder];
+    [enc setComputePipelineState:pipeline];
+
+    id<MTLBuffer> wbuf = (__bridge id<MTLBuffer>)weight_buf;
+    [enc setBuffer:wbuf offset:(NSUInteger)w_offset atIndex:0];
+    [enc setBuffer:wbuf offset:(NSUInteger)s_offset atIndex:1];
+    [enc setBuffer:wbuf offset:(NSUInteger)b_offset atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)x   offset:0 atIndex:3];
+    [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:4];
+    [enc setBytes:&M          length:sizeof(M)          atIndex:5];
+    [enc setBytes:&K          length:sizeof(K)          atIndex:6];
+    [enc setBytes:&group_size length:sizeof(group_size) atIndex:7];
+
+    [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc endEncoding];
+}
+
+void kernel_end_batch(void *batch_ptr) {
+    BatchContext *batch = batch_ptr;
+    [batch->cb commit];
+    [batch->cb waitUntilCompleted];
+    free(batch);
+}
+
 // BF16 matmul: 256-thread threadgroups, shared memory
 void kernel_matmul_bf16(MetalContext *ctx,
                         void *A, void *x, void *out,
