@@ -1,5 +1,6 @@
 #include "inference/dequant.h"
 
+#include <math.h>
 #include <string.h>
 
 float bf16_to_f32(uint16_t bf16) {
@@ -62,32 +63,48 @@ void dequant_matmul_q4(
 
     int K_packed = K / 8;          // U32s per row
     int num_groups = K / group_size;
+    int u32s_per_group = group_size / 8;
 
     for (int m = 0; m < M; m++) {
         float sum = 0.0f;
 
-        const uint32_t *row_w = weight + m * K_packed;
-        const uint16_t *row_s = scales + m * num_groups;
-        const uint16_t *row_b = biases + m * num_groups;
+        const uint32_t *row_w = weight + (size_t)m * K_packed;
+        const uint16_t *row_s = scales + (size_t)m * num_groups;
+        const uint16_t *row_b = biases + (size_t)m * num_groups;
 
         for (int g = 0; g < num_groups; g++) {
             float scale = bf16_to_f32(row_s[g]);
             float zero  = bf16_to_f32(row_b[g]);
 
             int base_k = g * group_size;
-            int u32s_per_group = group_size / 8;
             int u32_base = g * u32s_per_group;
 
             for (int u = 0; u < u32s_per_group; u++) {
                 uint32_t packed = row_w[u32_base + u];
                 int k_start = base_k + u * 8;
 
-                // Unroll 8 values from one U32
-                for (int b = 0; b < 8; b++) {
-                    int val = (int)((packed >> (b * 4)) & 0xF);
-                    float dequant = ((float)val - zero) * scale;
-                    sum += dequant * x[k_start + b];
-                }
+                // FMA-restructured dequant: fma(nibble, scale*x, -zero*scale*x)
+                // Saturates FMA pipeline instead of creating dependency chain
+                // Original: sum += ((val - zero) * scale) * x[k]
+                // Restructured: sum += fma(val, scale*x[k], -zero*scale*x[k])
+                float sx0 = scale * x[k_start];
+                float sx1 = scale * x[k_start + 1];
+                float sx2 = scale * x[k_start + 2];
+                float sx3 = scale * x[k_start + 3];
+                float sx4 = scale * x[k_start + 4];
+                float sx5 = scale * x[k_start + 5];
+                float sx6 = scale * x[k_start + 6];
+                float sx7 = scale * x[k_start + 7];
+
+                float nz = -zero;
+                sum += fmaf((float)((packed)       & 0xF), sx0, nz * sx0);
+                sum += fmaf((float)((packed >> 4)  & 0xF), sx1, nz * sx1);
+                sum += fmaf((float)((packed >> 8)  & 0xF), sx2, nz * sx2);
+                sum += fmaf((float)((packed >> 12) & 0xF), sx3, nz * sx3);
+                sum += fmaf((float)((packed >> 16) & 0xF), sx4, nz * sx4);
+                sum += fmaf((float)((packed >> 20) & 0xF), sx5, nz * sx5);
+                sum += fmaf((float)((packed >> 24) & 0xF), sx6, nz * sx6);
+                sum += fmaf((float)((packed >> 28) & 0xF), sx7, nz * sx7);
             }
         }
 
