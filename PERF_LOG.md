@@ -40,3 +40,9 @@
 - **35B**: 13.4 tok/s (no regression — uses mmap path for small 1MB experts)
 - **397B**: 2.7 tok/s cold, 5.6 tok/s warm (from 0.05 — **54-112x improvement**)
 - Key insight: parallel pread eliminates serial page faults, SSD serves 10 concurrent reads
+
+## Phase 6: Deferred expert command buffers
+- Change: Commit expert GPU work without waiting, defer accumulation to next layer
+- Overlaps expert GPU execution with next layer's attention start
+- **35B**: 13.4 tok/s (no regression)
+- **397B**: 2.7 tok/s cold, 5.5 tok/s warm (marginal — model produces few tokens before EOS)

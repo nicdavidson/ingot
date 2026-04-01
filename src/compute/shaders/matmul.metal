@@ -78,16 +78,28 @@ kernel void matmul_q4_fma(
         uint32_t packed = row_w[u];
         uint k_base = u * 8;
 
-        // FMA-restructured affine dequant: fma(nibble, scale*x, bias*x)
-        // Correct formula: dequant = nibble * scale + bias
-        sum += fma(float(packed        & 0xF), scale * x_shared[k_base],     bias * x_shared[k_base]);
-        sum += fma(float((packed >> 4)  & 0xF), scale * x_shared[k_base + 1], bias * x_shared[k_base + 1]);
-        sum += fma(float((packed >> 8)  & 0xF), scale * x_shared[k_base + 2], bias * x_shared[k_base + 2]);
-        sum += fma(float((packed >> 12) & 0xF), scale * x_shared[k_base + 3], bias * x_shared[k_base + 3]);
-        sum += fma(float((packed >> 16) & 0xF), scale * x_shared[k_base + 4], bias * x_shared[k_base + 4]);
-        sum += fma(float((packed >> 20) & 0xF), scale * x_shared[k_base + 5], bias * x_shared[k_base + 5]);
-        sum += fma(float((packed >> 24) & 0xF), scale * x_shared[k_base + 6], bias * x_shared[k_base + 6]);
-        sum += fma(float((packed >> 28) & 0xF), scale * x_shared[k_base + 7], bias * x_shared[k_base + 7]);
+        // Pre-compute scale*x and bias*x for each position.
+        // FMA: result += nibble * (scale*x) + (bias*x)
+        // This collapses dequant + dot product into a single FMA per nibble.
+        float sx0 = scale * x_shared[k_base],     bx0 = bias * x_shared[k_base];
+        float sx1 = scale * x_shared[k_base + 1], bx1 = bias * x_shared[k_base + 1];
+        float sx2 = scale * x_shared[k_base + 2], bx2 = bias * x_shared[k_base + 2];
+        float sx3 = scale * x_shared[k_base + 3], bx3 = bias * x_shared[k_base + 3];
+        float sx4 = scale * x_shared[k_base + 4], bx4 = bias * x_shared[k_base + 4];
+        float sx5 = scale * x_shared[k_base + 5], bx5 = bias * x_shared[k_base + 5];
+        float sx6 = scale * x_shared[k_base + 6], bx6 = bias * x_shared[k_base + 6];
+        float sx7 = scale * x_shared[k_base + 7], bx7 = bias * x_shared[k_base + 7];
+
+        // Accumulate bias*x terms first, then FMA nibble * sx into sum
+        sum += bx0 + bx1 + bx2 + bx3 + bx4 + bx5 + bx6 + bx7;
+        sum = fma(float(packed        & 0xF), sx0, sum);
+        sum = fma(float((packed >> 4)  & 0xF), sx1, sum);
+        sum = fma(float((packed >> 8)  & 0xF), sx2, sum);
+        sum = fma(float((packed >> 12) & 0xF), sx3, sum);
+        sum = fma(float((packed >> 16) & 0xF), sx4, sum);
+        sum = fma(float((packed >> 20) & 0xF), sx5, sum);
+        sum = fma(float((packed >> 24) & 0xF), sx6, sum);
+        sum = fma(float((packed >> 28) & 0xF), sx7, sum);
     }
 
     // --- SIMD reduction within each simdgroup ---

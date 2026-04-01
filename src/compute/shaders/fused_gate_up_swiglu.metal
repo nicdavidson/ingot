@@ -82,23 +82,24 @@ kernel void fused_gate_up_swiglu(
         uint g = u / u32s_per_group;
         uint k_base = u * 8;
 
-        // Gate projection - FMA affine dequant
         float gscale = bf16_to_float(grow_s[g]);
         float gbias  = bf16_to_float(grow_b[g]);
         uint32_t gpacked = grow_w[u];
 
-        // Up projection - FMA affine dequant
         float uscale = bf16_to_float(urow_s[g]);
         float ubias  = bf16_to_float(urow_b[g]);
         uint32_t upacked = urow_w[u];
 
-        // Process all 8 nibbles: dequant = nibble * scale + bias
+        // Pre-compute scale*x and bias*x, accumulate bias terms,
+        // then FMA nibble * sx into running sums
         for (uint b = 0; b < 8; b++) {
             float xv = x_shared[k_base + b];
-            float gn = float((gpacked >> (b * 4)) & 0xF);
-            float un = float((upacked >> (b * 4)) & 0xF);
-            gate_sum += fma(gn, gscale * xv, gbias * xv);
-            up_sum   += fma(un, uscale * xv, ubias * xv);
+            float gsx = gscale * xv, gbx = gbias * xv;
+            float usx = uscale * xv, ubx = ubias * xv;
+            gate_sum += gbx;
+            gate_sum = fma(float((gpacked >> (b * 4)) & 0xF), gsx, gate_sum);
+            up_sum += ubx;
+            up_sum = fma(float((upacked >> (b * 4)) & 0xF), usx, up_sum);
         }
     }
 
