@@ -12,3 +12,10 @@
 - **397B**: 0.1 tok/s (up from 0.04 — 2.5x improvement, GPU path confirmed working)
 - Note: 397B output still garbage (likely separate model/weight issue, not GPU-related)
 - Remaining bottleneck: ~300 metal_alloc/free cycles per token from temp buffers
+
+## Phase 2: Persistent GPU buffers for attention
+- Change: AttentionGPU struct with pre-allocated Metal buffers, pass gpu_norm_out handle directly
+- Eliminates per-call metal_alloc/free and input memcpy (hidden already on GPU)
+- **35B**: 4.0 tok/s (up from 3.7 baseline — 8% improvement)
+- **397B**: 0.05 tok/s (marginal — bottleneck is memory paging, expert files ~180GB exceed RAM)
+- Note: 397B speed limited by SSD-backed mmap, not GPU dispatch overhead
