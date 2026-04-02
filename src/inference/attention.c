@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Diagnostic gate from inference.c — only fires on first token
+extern int _diag_first_token;
+
 // --- GPU scratch for attention projections ---
 
 // Max simultaneous projection outputs for batching
@@ -490,7 +493,7 @@ void attention_deltanet_forward(
 #endif
 
     // DIAG: after QKV projection
-    if (layer_idx == 0) {
+    if (_diag_first_token && layer_idx == 0) {
         float ss = 0.0f;
         for (int i = 0; i < conv_dim; i++) ss += qkv[i] * qkv[i];
         fprintf(stderr, "[DN-DIAG L%d] qkv_proj rms=%.6f first4=[%.6f,%.6f,%.6f,%.6f]\n",
@@ -536,7 +539,7 @@ void attention_deltanet_forward(
     }
 
     // DIAG: after conv1d+SiLU
-    if (layer_idx == 0) {
+    if (_diag_first_token && layer_idx == 0) {
         float ss = 0.0f;
         for (int i = 0; i < conv_dim; i++) ss += qkv[i] * qkv[i];
         fprintf(stderr, "[DN-DIAG L%d] after conv1d rms=%.6f first4=[%.6f,%.6f,%.6f,%.6f]\n",
@@ -592,7 +595,7 @@ void attention_deltanet_forward(
     }
 
     // DIAG: after Q/K normalization
-    if (layer_idx == 0) {
+    if (_diag_first_token && layer_idx == 0) {
         float ss_q = 0.0f, ss_k = 0.0f;
         for (int i = 0; i < key_dim; i++) ss_q += query[i] * query[i];
         for (int i = 0; i < key_dim; i++) ss_k += key[i] * key[i];
@@ -724,7 +727,7 @@ void attention_deltanet_forward(
 #endif
 
     // DIAG: after recurrence
-    if (layer_idx == 0) {
+    if (_diag_first_token && layer_idx == 0) {
         float ss = 0.0f;
         for (int i = 0; i < value_dim; i++) ss += core_out[i] * core_out[i];
         fprintf(stderr, "[DN-DIAG L%d] core_out rms=%.6f first4=[%.8f,%.8f,%.8f,%.8f]\n",
@@ -756,7 +759,7 @@ void attention_deltanet_forward(
     }
 
     // DIAG: after gated RMSNorm
-    if (layer_idx == 0) {
+    if (_diag_first_token && layer_idx == 0) {
         float ss = 0.0f;
         for (int i = 0; i < value_dim; i++) ss += core_out[i] * core_out[i];
         fprintf(stderr, "[DN-DIAG L%d] after gated_norm rms=%.6f first4=[%.8f,%.8f,%.8f,%.8f]\n",
@@ -771,7 +774,7 @@ void attention_deltanet_forward(
     q4_proj(attn_out, core_out, model, gpu, base, H, value_dim);
 
     // DIAG: after o_proj
-    if (layer_idx == 0) {
+    if (_diag_first_token && layer_idx == 0) {
         float ss = 0.0f;
         for (int i = 0; i < H; i++) ss += attn_out[i] * attn_out[i];
         fprintf(stderr, "[DN-DIAG L%d] o_proj out rms=%.6f first4=[%.8f,%.8f,%.8f,%.8f]\n",

@@ -411,7 +411,7 @@ static float _diag_rms(const float *x, int n) {
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
     return sqrtf(ss / (float)n);
 }
-static int _diag_first_token = 1;
+int _diag_first_token = 1;  // non-static: attention.c references this via extern
 #define DIAG(label, buf, n) if (_diag_first_token && (layer_idx <= 2 || layer_idx == 10 || (layer_idx >= 20 && layer_idx <= 32) || layer_idx == 40 || layer_idx == 59)) \
     fprintf(stderr, "[DIAG L%d] %s: rms=%.6f [%.4f,%.4f,%.4f,%.4f]\n", layer_idx, label, _diag_rms(buf,n), (buf)[0], (buf)[1], (buf)[2], (buf)[3])
 
@@ -697,7 +697,9 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     if (ctx->use_gpu && K_active <= ctx->num_expert_slots && pread_experts) {
         // pread-based path: expert data is in staging buffers (Metal unified memory)
         // Wait for parallel pread() to complete
+        uint64_t _pread_t0 = timer_now_ns();
         expert_io_wait(ctx->expert_io);
+        uint64_t _pread_t1 = timer_now_ns();
 
         void *batch = kernel_begin_batch(ctx->metal);
         int batch_count = 0;
@@ -734,6 +736,11 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
         }
 
         ctx->prev_expert_signal = kernel_end_batch_deferred(batch);
+        uint64_t _gpu_t1 = timer_now_ns();
+        if (_diag_first_token && layer_idx < 4)
+            fprintf(stderr, "[EXPERT-TIMING L%d] pread_wait=%.2f gpu_setup=%.2f ms\n",
+                    layer_idx, timer_elapsed_ms(_pread_t0, _pread_t1),
+                    timer_elapsed_ms(_pread_t1, _gpu_t1));
         for (int k = 0; k < batch_count; k++) {
             ctx->prev_expert_weights[k] = top_weights[k];
         }
