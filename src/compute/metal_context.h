@@ -22,6 +22,7 @@ void *metal_wrap_buffer(MetalContext *ctx, void *data, size_t size);
 
 // Create a new GPU buffer of given size.
 void *metal_alloc_buffer(MetalContext *ctx, size_t size);
+void *metal_alloc_buffer_aligned(MetalContext *ctx, size_t size, size_t alignment);
 
 // Free a Metal buffer.
 void metal_free_buffer(void *buffer);

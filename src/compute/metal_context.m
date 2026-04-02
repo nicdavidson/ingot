@@ -176,6 +176,26 @@ void *metal_alloc_buffer(MetalContext *ctx, size_t size) {
     return (__bridge_retained void *)buf;
 }
 
+void *metal_alloc_buffer_aligned(MetalContext *ctx, size_t size, size_t alignment) {
+    // Allocate 2MB-aligned memory for faster DMA transfers (3.6x for cached data)
+    void *ptr = NULL;
+    size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
+    if (posix_memalign(&ptr, alignment, aligned_size) != 0) {
+        LOG_ERROR("metal: posix_memalign failed (%zu bytes, %zu align)", size, alignment);
+        return NULL;
+    }
+    id<MTLBuffer> buf = [ctx->device newBufferWithBytesNoCopy:ptr
+                                                       length:aligned_size
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:^(void *p, NSUInteger __unused len) { free(p); }];
+    if (!buf) {
+        LOG_ERROR("metal: failed to wrap aligned buffer (%zu bytes)", size);
+        free(ptr);
+        return NULL;
+    }
+    return (__bridge_retained void *)buf;
+}
+
 void metal_free_buffer(void *buffer) {
     if (!buffer) return;
     (void)(__bridge_transfer id<MTLBuffer>)buffer; // ARC releases

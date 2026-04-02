@@ -18,8 +18,8 @@ inline float bf16_to_float(ushort val) {
     return as_type<float>(uint(val) << 16);
 }
 
-// Shared memory budget: 4096 floats = 16KB (well within 32KB limit)
-constant uint SHARED_DIM = 4096;
+// Shared memory budget: 8192 halfs = 16KB (same budget, 2x elements via half precision)
+constant uint SHARED_DIM = 8192;
 
 kernel void matmul_q4_fma(
     device const uint32_t *weights  [[buffer(0)]],  // [M, K/8] packed nibbles
@@ -39,20 +39,20 @@ kernel void matmul_q4_fma(
     if (row >= M) return;
 
     // --- Cache input vector in shared memory if it fits ---
-    threadgroup float x_shared[SHARED_DIM];
+    threadgroup half x_shared[SHARED_DIM];
     bool use_shared = (K <= SHARED_DIM);
 
     if (use_shared) {
         uint k4 = K / 4;
         for (uint i = tid; i < k4; i += 256) {
             float4 val = *reinterpret_cast<device const float4 *>(x + i * 4);
-            x_shared[i * 4]     = val.x;
-            x_shared[i * 4 + 1] = val.y;
-            x_shared[i * 4 + 2] = val.z;
-            x_shared[i * 4 + 3] = val.w;
+            x_shared[i * 4]     = half(val.x);
+            x_shared[i * 4 + 1] = half(val.y);
+            x_shared[i * 4 + 2] = half(val.z);
+            x_shared[i * 4 + 3] = half(val.w);
         }
         for (uint i = k4 * 4 + tid; i < K; i += 256) {
-            x_shared[i] = x[i];
+            x_shared[i] = half(x[i]);
         }
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     }
@@ -79,10 +79,10 @@ kernel void matmul_q4_fma(
         // Read input values from shared memory or device memory
         float x0, x1, x2, x3, x4, x5, x6, x7;
         if (use_shared) {
-            x0 = x_shared[k_base];     x1 = x_shared[k_base + 1];
-            x2 = x_shared[k_base + 2]; x3 = x_shared[k_base + 3];
-            x4 = x_shared[k_base + 4]; x5 = x_shared[k_base + 5];
-            x6 = x_shared[k_base + 6]; x7 = x_shared[k_base + 7];
+            x0 = float(x_shared[k_base]);     x1 = float(x_shared[k_base + 1]);
+            x2 = float(x_shared[k_base + 2]); x3 = float(x_shared[k_base + 3]);
+            x4 = float(x_shared[k_base + 4]); x5 = float(x_shared[k_base + 5]);
+            x6 = float(x_shared[k_base + 6]); x7 = float(x_shared[k_base + 7]);
         } else {
             x0 = x[k_base];     x1 = x[k_base + 1];
             x2 = x[k_base + 2]; x3 = x[k_base + 3];
@@ -147,7 +147,7 @@ kernel void matmul_bf16(
     uint row = tg_id;
     if (row >= M) return;
 
-    threadgroup float x_shared[SHARED_DIM];
+    threadgroup half x_shared[SHARED_DIM];
     bool use_shared = (K <= SHARED_DIM);
 
     if (use_shared) {
@@ -170,7 +170,7 @@ kernel void matmul_bf16(
 
     if (use_shared) {
         for (uint k = tid; k < K; k += 256) {
-            sum += bf16_to_float(row_a[k]) * x_shared[k];
+            sum += bf16_to_float(row_a[k]) * float(x_shared[k]);
         }
     } else {
         for (uint k = tid; k < K; k += 256) {

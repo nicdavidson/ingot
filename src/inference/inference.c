@@ -218,7 +218,7 @@ InferenceContext *inference_create(Model *model) {
             if (max_stride > 0) {
                 bool staging_ok = true;
                 for (int i = 0; i < K_max; i++) {
-                    ctx->gpu_expert_staging[i] = metal_alloc_buffer(ctx->metal, max_stride);
+                    ctx->gpu_expert_staging[i] = metal_alloc_buffer_aligned(ctx->metal, max_stride, 2 * 1024 * 1024);
                     if (ctx->gpu_expert_staging[i]) {
                         ctx->cpu_expert_staging[i] = metal_buffer_contents(
                             ctx->gpu_expert_staging[i]);
