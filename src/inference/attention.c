@@ -5,7 +5,9 @@
 #include "util/log.h"
 
 #ifdef PLATFORM_MACOS
+#include "util/timer.h"
 #include <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
 #include "compute/kernels.h"
 #include "compute/metal_context.h"
 #endif
@@ -418,6 +420,19 @@ void attention_swa_forward(
 //   S = S + k_t.outer(delta)              — write to state
 //   output = (S * q_t).sum(key_dim)       — query the state
 
+
+#ifdef PLATFORM_MACOS
+static double _dn_acc_proj = 0, _dn_acc_conv = 0, _dn_acc_recur = 0;
+static double _dn_acc_norm = 0, _dn_acc_oproj = 0, _dn_acc_loads = 0;
+static int _dn_layer_count = 0;
+void attention_dn_timing_report(int token_num) {
+    double total = _dn_acc_proj + _dn_acc_conv + _dn_acc_recur + _dn_acc_norm + _dn_acc_oproj + _dn_acc_loads;
+    fprintf(stderr, "[DN-TIMING tok%d] proj=%.1f conv=%.1f recur=%.1f norm=%.1f oproj=%.1f loads=%.1f TOTAL=%.1f ms (%d layers)\n",
+            token_num, _dn_acc_proj, _dn_acc_conv, _dn_acc_recur, _dn_acc_norm, _dn_acc_oproj, _dn_acc_loads, total, _dn_layer_count);
+    _dn_acc_proj = _dn_acc_conv = _dn_acc_recur = _dn_acc_norm = _dn_acc_oproj = _dn_acc_loads = 0;
+    _dn_layer_count = 0;
+}
+#endif
 void attention_deltanet_forward(
     float *attn_out, const float *hidden,
     const Model *model, const ModelConfig *cfg,
@@ -435,6 +450,10 @@ void attention_deltanet_forward(
     int value_dim = num_v_heads * head_v_dim;  // total value dimension
     int conv_dim = key_dim * 2 + value_dim;    // QKV fused dimension
 
+
+#ifdef PLATFORM_MACOS
+    uint64_t _dt0 = timer_now_ns(), _dt1;
+#endif
     char base[128], wname[128];
 
     // 1-5. Batch all projections from hidden (qkv, b, a, z) in one GPU commit
@@ -486,6 +505,9 @@ void attention_deltanet_forward(
                 layer_idx, a_raw[0], a_raw[1], a_raw[2], a_raw[3]);
     }
 
+#ifdef PLATFORM_MACOS
+    _dt1 = timer_now_ns(); _dn_acc_proj += timer_elapsed_ms(_dt0, _dt1); _dt0 = _dt1;
+#endif
     // 2. Causal conv1d with state tracking
     int kernel_size = cfg->linear_attn.linear_conv_kernel_dim;
     float *conv_weight = calloc((size_t)conv_dim * (size_t)kernel_size, sizeof(float));
@@ -584,6 +606,9 @@ void attention_deltanet_forward(
                 layer_idx, sqrtf(ss_v/(float)value_dim), value[0], value[1], value[2], value[3]);
     }
 
+#ifdef PLATFORM_MACOS
+    _dt1 = timer_now_ns(); _dn_acc_conv += timer_elapsed_ms(_dt0, _dt1); _dt0 = _dt1;
+#endif
     // 8. Recurrent state update (per head)
     // State S is [num_k_heads, head_k_dim, head_v_dim]
     // But HF uses num_v_heads for the outer loop — heads may be grouped
@@ -596,6 +621,62 @@ void attention_deltanet_forward(
     int v_per_k = num_v_heads / num_k_heads; // value heads per key head
     int state_size = head_k_dim * head_v_dim;
 
+#ifdef PLATFORM_MACOS
+    // GCD-parallelized recurrence: dispatch key heads to separate cores
+    // Each key head processes its v_per_k value heads sequentially
+    // Pre-allocate scratch per key head to avoid calloc inside dispatch blocks
+    float *kv_scratch = calloc((size_t)num_k_heads * head_v_dim, sizeof(float));
+    float *delta_scratch = calloc((size_t)num_k_heads * head_v_dim, sizeof(float));
+
+    dispatch_apply((size_t)num_k_heads,
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+        ^(size_t kh_idx) {
+        int kh = (int)kh_idx;
+        float *q_h = query + kh * head_k_dim;
+        float *k_h = key + kh * head_k_dim;
+        float *my_kv = kv_scratch + kh * head_v_dim;
+        float *my_delta = delta_scratch + kh * head_v_dim;
+
+        for (int vh_local = 0; vh_local < v_per_k; vh_local++) {
+            int vh = kh * v_per_k + vh_local;
+            float *v_h = value + vh * head_v_dim;
+            float g_h = g[vh];
+            float beta_h = beta[vh];
+            float *S = state + ((size_t)kh * v_per_k + vh_local) *
+                       (size_t)state_size;
+            float decay_val = expf(g_h);
+
+            cblas_sscal(state_size, decay_val, S, 1);
+
+            cblas_sgemv(CblasRowMajor, CblasTrans,
+                        head_k_dim, head_v_dim,
+                        1.0f, S, head_v_dim,
+                        k_h, 1,
+                        0.0f, my_kv, 1);
+
+            for (int vd = 0; vd < head_v_dim; vd++) {
+                my_delta[vd] = (v_h[vd] - my_kv[vd]) * beta_h;
+            }
+
+            cblas_sger(CblasRowMajor,
+                       head_k_dim, head_v_dim,
+                       1.0f, k_h, 1, my_delta, 1,
+                       S, head_v_dim);
+
+            float *out_h = core_out + vh * head_v_dim;
+            cblas_sgemv(CblasRowMajor, CblasTrans,
+                        head_k_dim, head_v_dim,
+                        1.0f, S, head_v_dim,
+                        q_h, 1,
+                        1.0f, out_h, 1);
+        }
+    });
+
+    free(kv_scratch);
+    free(delta_scratch);
+
+#else
+    // Portable scalar fallback for non-Apple platforms
     for (int kh = 0; kh < num_k_heads; kh++) {
         float *q_h = query + kh * head_k_dim;
         float *k_h = key + kh * head_k_dim;
@@ -605,61 +686,12 @@ void attention_deltanet_forward(
             float *v_h = value + vh * head_v_dim;
             float g_h = g[vh];
             float beta_h = beta[vh];
-
-            // State for this head pair: S[head_k_dim, head_v_dim] row-major
             float *S = state + ((size_t)kh * v_per_k + vh_local) *
                        (size_t)state_size;
-
             float decay = expf(g_h);
 
-#ifdef PLATFORM_MACOS
-            // Accelerate BLAS path — avoids GPU kernel launch overhead
-            // for these small dense matrices (128x128)
+            for (int i = 0; i < state_size; i++) S[i] *= decay;
 
-            // Decay state: S *= decay
-            cblas_sscal(state_size, decay, S, 1);
-
-            // Read from state: kv_mem = S^T @ k
-            // S is [head_k_dim, head_v_dim] row-major
-            // We want kv_mem[vd] = sum_kd(S[kd][vd] * k[kd]) = S^T @ k
-            float *kv_mem = calloc((size_t)head_v_dim, sizeof(float));
-            cblas_sgemv(CblasRowMajor, CblasTrans,
-                        head_k_dim, head_v_dim,
-                        1.0f, S, head_v_dim,
-                        k_h, 1,
-                        0.0f, kv_mem, 1);
-
-            // Delta: (v - kv_mem) * beta
-            float *delta = calloc((size_t)head_v_dim, sizeof(float));
-            for (int vd = 0; vd < head_v_dim; vd++) {
-                delta[vd] = (v_h[vd] - kv_mem[vd]) * beta_h;
-            }
-
-            // Write to state: S += k outer delta
-            cblas_sger(CblasRowMajor,
-                       head_k_dim, head_v_dim,
-                       1.0f, k_h, 1, delta, 1,
-                       S, head_v_dim);
-
-            // Query state: out = S^T @ q
-            float *out_h = core_out + vh * head_v_dim;
-            cblas_sgemv(CblasRowMajor, CblasTrans,
-                        head_k_dim, head_v_dim,
-                        1.0f, S, head_v_dim,
-                        q_h, 1,
-                        1.0f, out_h, 1);  // accumulate (beta=1)
-
-            free(kv_mem);
-            free(delta);
-#else
-            // Portable scalar fallback for non-Apple platforms
-
-            // Decay state
-            for (int i = 0; i < state_size; i++) {
-                S[i] *= decay;
-            }
-
-            // Read from state: kv_mem[vd] = sum_kd(S[kd][vd] * k[kd])
             float *kv_mem = calloc((size_t)head_v_dim, sizeof(float));
             for (int kd = 0; kd < head_k_dim; kd++) {
                 for (int vd = 0; vd < head_v_dim; vd++) {
@@ -667,20 +699,17 @@ void attention_deltanet_forward(
                 }
             }
 
-            // Delta: (v - kv_mem) * beta
             float *delta = calloc((size_t)head_v_dim, sizeof(float));
             for (int vd = 0; vd < head_v_dim; vd++) {
                 delta[vd] = (v_h[vd] - kv_mem[vd]) * beta_h;
             }
 
-            // Write to state: S += k.outer(delta)
             for (int kd = 0; kd < head_k_dim; kd++) {
                 for (int vd = 0; vd < head_v_dim; vd++) {
                     S[kd * head_v_dim + vd] += k_h[kd] * delta[vd];
                 }
             }
 
-            // Query state: out[vd] = sum_kd(S[kd][vd] * q[kd])
             float *out_h = core_out + vh * head_v_dim;
             for (int kd = 0; kd < head_k_dim; kd++) {
                 for (int vd = 0; vd < head_v_dim; vd++) {
@@ -690,9 +719,9 @@ void attention_deltanet_forward(
 
             free(kv_mem);
             free(delta);
-#endif
         }
     }
+#endif
 
     // DIAG: after recurrence
     if (layer_idx == 0) {
@@ -702,6 +731,9 @@ void attention_deltanet_forward(
                 layer_idx, sqrtf(ss/(float)value_dim), core_out[0], core_out[1], core_out[2], core_out[3]);
     }
 
+#ifdef PLATFORM_MACOS
+    _dt1 = timer_now_ns(); _dn_acc_recur += timer_elapsed_ms(_dt0, _dt1); _dt0 = _dt1;
+#endif
     // 9. RMSNormGated: rmsnorm(core_out) * silu(z)
     float *norm_w = calloc((size_t)head_v_dim, sizeof(float));
     snprintf(wname, sizeof(wname), "layers.%d.linear_attn.norm.weight", layer_idx);
@@ -731,6 +763,9 @@ void attention_deltanet_forward(
                 layer_idx, sqrtf(ss/(float)value_dim), core_out[0], core_out[1], core_out[2], core_out[3]);
     }
 
+#ifdef PLATFORM_MACOS
+    _dt1 = timer_now_ns(); _dn_acc_norm += timer_elapsed_ms(_dt0, _dt1); _dt0 = _dt1;
+#endif
     // 10. Output projection
     snprintf(base, sizeof(base), "layers.%d.linear_attn.out_proj", layer_idx);
     q4_proj(attn_out, core_out, model, gpu, base, H, value_dim);
@@ -743,6 +778,10 @@ void attention_deltanet_forward(
                 layer_idx, sqrtf(ss/(float)H), attn_out[0], attn_out[1], attn_out[2], attn_out[3]);
     }
 
+#ifdef PLATFORM_MACOS
+    _dt1 = timer_now_ns(); _dn_acc_oproj += timer_elapsed_ms(_dt0, _dt1);
+    _dn_layer_count++;
+#endif
     free(qkv); free(b_raw); free(beta); free(a_raw);
     free(A_log); free(dt_bias_w); free(g); free(z);
     free(core_out); free(norm_w); free(conv_weight);

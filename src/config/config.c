@@ -104,12 +104,11 @@ bool config_load(ModelConfig *cfg, const char *path) {
         return false;
     }
 
-    // All the fields we need live under "text_config"
+    // Try text_config first, fall back to root object for models without nesting
     int text_idx = json_get(&doc, 0, "text_config");
     if (text_idx < 0) {
-        LOG_ERROR("config: missing text_config");
-        free(json);
-        return false;
+        text_idx = 0;  // Use root object directly
+        LOG_INFO("config: no text_config found, reading from root");
     }
 
     int idx;

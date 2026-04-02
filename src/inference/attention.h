@@ -43,4 +43,11 @@ void attention_deltanet_forward(
     int          position
 );
 
+
+// DeltaNet per-token timing report (macOS only, no-op elsewhere)
+#ifdef PLATFORM_MACOS
+void attention_dn_timing_report(int token_num);
+#else
+static inline void attention_dn_timing_report(int token_num) { (void)token_num; }
+#endif
 #endif

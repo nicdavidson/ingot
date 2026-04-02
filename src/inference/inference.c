@@ -942,7 +942,7 @@ int inference_generate(InferenceContext *ctx,
 #ifdef PLATFORM_MACOS
         complete_deferred_experts(ctx);
 #endif
-        if (_diag_first_token) _timing_report(0);
+        if (_diag_first_token) { _timing_report(0); attention_dn_timing_report(0); }
     }
 
     uint64_t t_prefill = timer_now_ns();
@@ -971,7 +971,7 @@ int inference_generate(InferenceContext *ctx,
 #ifdef PLATFORM_MACOS
             complete_deferred_experts(ctx);
 #endif
-            if (t < 3) _timing_report(t + 1);
+            if (t < 3) { _timing_report(t + 1); attention_dn_timing_report(t + 1); }
 
             compute_logits(ctx);
         }
