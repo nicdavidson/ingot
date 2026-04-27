@@ -640,18 +640,6 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
                            ctx->norm_out, position);
         compressed_kv = v4_compressor_cache(ctx->compressor, layer_idx,
                                             &compressed_count);
-        if (layer_idx == 2 && (position == 3 || position == 7 || position == 11)) {
-            float ss = 0.0f; int nan = 0;
-            int n = compressed_count * cfg->head_dim;
-            for (int i = 0; i < n; i++) {
-                float v = compressed_kv[i];
-                if (!(v == v)) nan++;
-                ss += v * v;
-            }
-            LOG_INFO("v4_compressor diag: L%d pos=%d compressed_count=%d rms=%.4f nan=%d",
-                     layer_idx, position, compressed_count,
-                     n > 0 ? sqrtf(ss / n) : 0.0f, nan);
-        }
     }
 
     // Attention forward pass (MLA)

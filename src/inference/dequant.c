@@ -311,6 +311,77 @@ void dequant_matmul_q2(
     }
 }
 
+// FP8 E4M3 quantize-then-dequantize in-place, with E8M0 (power-of-2) per-group
+// scale. Mirrors the reference's act_quant with scale_fmt="ue8m0", scale_dtype=FP8.
+//
+// Per group of `block_size`:
+//   1. amax = max(|x|)
+//   2. scale = 2^ceil(log2(amax / 448))   (E8M0 — round UP to power-of-2)
+//   3. q = clamp(x / scale, ±448), rounded to E4M3 (3-bit mantissa)
+//   4. x = q * scale
+//
+// E4M3 spec (FN — finite, no NaN/Inf): sign + 4-bit exp (bias=7) + 3-bit
+// mantissa. Smallest normal 2^-6, max 448. We simulate by computing
+// 2^floor(log2(|q|)) for the value's own exponent, then rounding the
+// mantissa to 3 bits.
+void fp8_act_quant_inplace(float *x, int len, int block_size) {
+    const float fp8_max = 448.0f;
+    const float fp8_max_inv = 1.0f / fp8_max;
+
+    int n_groups = len / block_size;
+    for (int g = 0; g < n_groups; g++) {
+        float *block = x + g * block_size;
+
+        float amax = 0.0f;
+        for (int i = 0; i < block_size; i++) {
+            float a = fabsf(block[i]);
+            if (a > amax) amax = a;
+        }
+        if (amax == 0.0f) continue;
+
+        // scale = 2^ceil(log2(amax/fp8_max)). Use frexpf which writes
+        // mantissa ∈ [0.5, 1.0) and exponent so that x = mantissa * 2^exp;
+        // ceil(log2(x)) = exp when mantissa==0.5 else exp.
+        float ratio = amax * fp8_max_inv;
+        int exp;
+        float mant = frexpf(ratio, &exp);
+        if (mant > 0.5f) exp += 1;     // strictly greater → ceiling rounds up
+        // (mant == 0.5 means ratio is exactly a power of 2, no rounding needed)
+        float scale = ldexpf(1.0f, exp);
+        float inv_scale = 1.0f / scale;
+
+        for (int i = 0; i < block_size; i++) {
+            float q = block[i] * inv_scale;
+            // Clamp to FP8 range
+            if (q >  fp8_max) q =  fp8_max;
+            if (q < -fp8_max) q = -fp8_max;
+
+            // Round to E4M3 representable: 1 sign + 4 exp (bias 7) + 3 mantissa.
+            // Smallest normal = 2^-6. For |q| < 2^-9 (smallest subnormal), → 0.
+            float aq = fabsf(q);
+            if (aq < 0.001953125f) {   // 2^-9
+                block[i] = 0.0f;
+                continue;
+            }
+            int qexp;
+            float qmant = frexpf(aq, &qexp);  // qmant in [0.5, 1), aq = qmant * 2^qexp
+            if (qexp < -5) {
+                // Subnormal range: clamp to smallest representable
+                qexp = -5;
+            }
+            // E4M3 has 3 mantissa bits → 8 levels in [1.0, 2.0).
+            // Convert qmant from [0.5, 1) to [1.0, 2.0) by adjusting exp.
+            float m = qmant * 2.0f;        // [1.0, 2.0)
+            qexp -= 1;
+            // Quantize m to nearest of 8 levels
+            float m_q = roundf(m * 8.0f) * (1.0f / 8.0f);
+            if (m_q >= 2.0f) { m_q = 1.0f; qexp += 1; }
+            float reconstructed = ldexpf(m_q, qexp);
+            block[i] = (q < 0.0f ? -reconstructed : reconstructed) * scale;
+        }
+    }
+}
+
 // MXFP4 (FP4 E2M1 + E8M0 group exponent) used by V4 routed experts.
 //
 // FP4 E2M1 codes (sign | exp(2) | mantissa(1)):

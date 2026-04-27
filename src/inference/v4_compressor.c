@@ -337,6 +337,12 @@ int v4_compressor_step(V4Compressor *c, const Model *model,
     apply_rope_inplace(out_kv, head_dim, rope_dim, compressed_position,
                        (float)c->csa_rope_theta);
 
+    // 7b. FP8 simulation on the non-rope dims (QAT precision). Reference
+    // applies act_quant(kv[..., :-rd], 64, ...) here. (rotate=True path
+    // exists for indexer's own compressor — V4-Flash main attention compressor
+    // uses rotate=False which is this branch.)
+    fp8_act_quant_inplace(out_kv, head_dim - rope_dim, 64);
+
     // 8. Append to cache. For CSA also rotate state: state[:ratio] = state[ratio:].
     if (lc->cache_count < lc->cache_capacity) {
         memcpy(lc->cache + (size_t)lc->cache_count * head_dim, out_kv,

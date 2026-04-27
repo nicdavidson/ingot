@@ -1218,6 +1218,9 @@ void attention_v4_mla_forward(
         kv[idx + 1] = x0 * s + x1 * c;
     }
 
+    // 5b. FP8 simulation on KV non-rope dims (QAT precision the model expects).
+    fp8_act_quant_inplace(kv, nope_dim, 64);
+
     // 6. Cache: K and V are the same RoPE'd vector.
     cache_kv_append(cache, kv_layer_idx, kv, kv);
     free(kv);

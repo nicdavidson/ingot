@@ -92,6 +92,16 @@ void dequant_row_q2(
     int          group_size
 );
 
+// --- FP8 quantize + dequantize (in-place, simulates QAT precision) ---
+// V4-Flash was trained with FP8 activations on KV non-rope dims, with E8M0
+// power-of-2 scales per block_size group. Skipping this fake-quant produces
+// gradual distribution drift over many layers.
+//
+// E4M3 FP8: sign(1) + exp(4) + mantissa(3), bias=7, max=448.
+// E8M0 scale: power-of-2 only, so scale = 2^ceil(log2(amax / 448)).
+
+void fp8_act_quant_inplace(float *x, int len, int block_size);
+
 // --- MXFP4 (Microscaling FP4) — used by DeepSeek V4 routed experts ---
 // Weights are 4-bit FP4 (E2M1) packed 8 per U32, identical layout to Q4.
 // Scales are E8M0 stored as U8: scale = 2^(byte - 127). Group size = 32.
