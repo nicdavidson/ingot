@@ -4,10 +4,19 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Layer attention type — 3:1 ratio of linear (DeltaNet) to full (SWA)
+// Model architecture family
 typedef enum {
-    LAYER_LINEAR_ATTENTION,
-    LAYER_FULL_ATTENTION,
+    ARCH_QWEN35,
+    ARCH_DEEPSEEK_V4,
+} ModelArch;
+
+// Layer attention type
+typedef enum {
+    LAYER_LINEAR_ATTENTION,   // Qwen 3.5: DeltaNet
+    LAYER_FULL_ATTENTION,     // Qwen 3.5: SWA (sliding window with GQA)
+    LAYER_V4_SLIDING_WINDOW,  // V4: sliding window only (compress_ratio=0)
+    LAYER_V4_CSA,             // V4: compressed sparse attention (ratio=4)
+    LAYER_V4_HCA,             // V4: heavily compressed attention (ratio=128)
 } LayerType;
 
 // RoPE configuration
@@ -18,7 +27,7 @@ typedef struct {
     int    mrope_section[3];
 } RopeConfig;
 
-// DeltaNet (linear attention) configuration
+// DeltaNet (linear attention) configuration — Qwen 3.5 only
 typedef struct {
     int linear_conv_kernel_dim;
     int linear_key_head_dim;
@@ -27,10 +36,34 @@ typedef struct {
     int linear_value_head_dim;
 } LinearAttnConfig;
 
+// DeepSeek V4 attention configuration
+typedef struct {
+    int  q_lora_rank;
+    int  o_lora_rank;
+    int  o_groups;
+    int  qk_rope_head_dim;
+
+    int *compress_ratios;    // per-layer array
+    double compress_rope_theta;
+
+    int  index_head_dim;
+    int  index_n_heads;
+    int  index_topk;
+
+    int  hc_mult;
+    float hc_eps;
+    int  hc_sinkhorn_iters;
+
+    int  num_hash_layers;
+    int  window_size;
+    double route_scale;        // routed_scaling_factor (V4: 1.5)
+} V4AttnConfig;
+
 // Model configuration — parsed from HuggingFace config.json
 typedef struct {
     // Identity
-    char model_name[256];
+    char     model_name[256];
+    ModelArch arch;
 
     // Core dimensions
     int hidden_size;
@@ -55,25 +88,20 @@ typedef struct {
 
     // Layer pattern
     int              full_attention_interval;
-    LayerType       *layer_types;  // array of num_hidden_layers
+    LayerType       *layer_types;
 
     // Attention sub-configs
     RopeConfig       rope;
     LinearAttnConfig linear_attn;
+    V4AttnConfig     v4;
     bool             attn_output_gate;
 
     // MTP (multi-token prediction)
     int  mtp_num_hidden_layers;
 } ModelConfig;
 
-// Parse a HuggingFace config.json file into ModelConfig.
-// Returns true on success. Caller must free with config_free().
 bool config_load(ModelConfig *cfg, const char *path);
-
-// Free dynamically allocated fields in config.
 void config_free(ModelConfig *cfg);
-
-// Print config summary to log.
 void config_print(const ModelConfig *cfg);
 
 #endif

@@ -691,14 +691,46 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
     bool use_hash = (layer_idx < cfg->v4.num_hash_layers);
 
     if (!use_hash) {
-        q4_matmul(ctx, ctx->gate_logits, ctx->norm_out, name, sname, bname,
-                  num_experts, H, 64);
+        // Non-hash V4 gate: BF16 weight [num_experts, H], no scales/biases.
+        // Reference Gate.forward (model.py:564): scores = sqrtsoftplus(W @ x).
+        // For top-K selection, ADD e_score_correction_bias to a copy. Weights
+        // are gathered from the UNBIASED scores (the "noaux_tc" trick).
+        size_t gw_sz;
+        const void *gate_w_bf16 = model_get_weight(ctx->model, name, &gw_sz);
+        if (gate_w_bf16 && gw_sz == (size_t)num_experts * (size_t)H * sizeof(uint16_t)) {
+            const uint16_t *W = gate_w_bf16;
+            for (int e = 0; e < num_experts; e++) {
+                float dot = 0.0f;
+                const uint16_t *row = W + (size_t)e * (size_t)H;
+                for (int k = 0; k < H; k++)
+                    dot += bf16_to_f32(row[k]) * ctx->norm_out[k];
+                ctx->gate_logits[e] = dot;
+            }
+        } else {
+            q4_matmul(ctx, ctx->gate_logits, ctx->norm_out, name, sname, bname,
+                      num_experts, H, 64);
+        }
 
-        // sqrtsoftplus gating instead of softmax
+        // sqrtsoftplus → original_scores (unbiased, used for weights).
         float *gate_probs = arena_alloc(&ctx->arena, (size_t)num_experts * sizeof(float));
         v4_sqrtsoftplus_gate(gate_probs, ctx->gate_logits, num_experts);
 
-        // Top-K selection
+        // Biased copy for top-K selection only.
+        char bias_name[160];
+        snprintf(bias_name, sizeof(bias_name),
+                 "layers.%d.ffn.gate.e_score_correction_bias", layer_idx);
+        size_t bias_sz;
+        const void *bias_raw = model_get_weight(ctx->model, bias_name, &bias_sz);
+        float *biased_probs = arena_alloc(&ctx->arena,
+                                          (size_t)num_experts * sizeof(float));
+        memcpy(biased_probs, gate_probs, (size_t)num_experts * sizeof(float));
+        if (bias_raw && bias_sz == (size_t)num_experts * sizeof(float)) {
+            const float *bias_v = bias_raw;
+            for (int e = 0; e < num_experts; e++)
+                biased_probs[e] += bias_v[e];
+        }
+
+        // Top-K selection on biased scores; weights come from unbiased scores.
         int top_indices[16];
         float top_weights[16];
         for (int k = 0; k < K_active && k < 16; k++) {
@@ -709,20 +741,23 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
                 for (int j = 0; j < k; j++)
                     if (top_indices[j] == e) { skip = true; break; }
                 if (skip) continue;
-                if (gate_probs[e] > best) {
-                    best = gate_probs[e];
+                if (biased_probs[e] > best) {
+                    best = biased_probs[e];
                     best_idx = e;
                 }
             }
             top_indices[k] = best_idx;
-            top_weights[k] = best;
+            top_weights[k] = gate_probs[best_idx];   // unbiased weight
         }
 
-        // Renormalize weights
+        // Renormalize weights, then scale by routed_scaling_factor (V4: 1.5).
         float wsum = 0.0f;
         for (int k = 0; k < K_active; k++) wsum += top_weights[k];
+        float route_scale_nh = (float)cfg->v4.route_scale;
+        if (route_scale_nh == 0.0f) route_scale_nh = 1.0f;
         if (wsum > 0.0f)
-            for (int k = 0; k < K_active; k++) top_weights[k] /= wsum;
+            for (int k = 0; k < K_active; k++)
+                top_weights[k] = (top_weights[k] / wsum) * route_scale_nh;
 
         // Kick off parallel pread for routed experts (overlaps with shared expert)
 #ifdef PLATFORM_MACOS
@@ -809,13 +844,8 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
             snprintf(bname, sizeof(bname), "layers.%d.ffn.shared_experts.up_proj.biases", layer_idx);
             q4_matmul(ctx, up_out, ctx->norm_out, name, sname, bname, moe_dim, H, 64);
 
-            for (int i = 0; i < moe_dim; i++) {
-                if (gate_out[i] > 10.0f) gate_out[i] = 10.0f;
-                if (gate_out[i] < -10.0f) gate_out[i] = -10.0f;
-                if (up_out[i] > 10.0f) up_out[i] = 10.0f;
-                if (up_out[i] < -10.0f) up_out[i] = -10.0f;
-            }
-
+            // Reference shared expert constructs Expert() with default
+            // swiglu_limit=0, which skips the clamp entirely (model.py:628).
             cpu_silu_mul(ffn_mid, gate_out, up_out, moe_dim);
 
             snprintf(name, sizeof(name), "layers.%d.ffn.shared_experts.down_proj.weight", layer_idx);
@@ -925,11 +955,13 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
                 float *r_up = arena_alloc(&ctx->arena, (size_t)moe_dim * sizeof(float));
                 dequant_matmul_mxfp4(r_up, uw, us, ctx->norm_out, moe_dim, H, group_size);
 
+                // Reference Expert.forward (model.py:601):
+                //   up = clamp(up, -limit, limit)  (symmetric)
+                //   gate = clamp(gate, max=limit)  (UPPER ONLY — not symmetric)
                 for (int i = 0; i < moe_dim; i++) {
                     if (r_gate[i] > 10.0f) r_gate[i] = 10.0f;
-                    if (r_gate[i] < -10.0f) r_gate[i] = -10.0f;
-                    if (r_up[i] > 10.0f) r_up[i] = 10.0f;
-                    if (r_up[i] < -10.0f) r_up[i] = -10.0f;
+                    if (r_up[i]   >  10.0f) r_up[i]   =  10.0f;
+                    if (r_up[i]   < -10.0f) r_up[i]   = -10.0f;
                 }
 
                 float *r_mid = arena_alloc(&ctx->arena, (size_t)moe_dim * sizeof(float));
@@ -950,29 +982,65 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
             }
         }
     } else {
-        // Hash routing: tid2eid lookup — no gating compute needed.
-        // Each token_id maps directly to K_active expert indices.
+        // Hash routing: tid2eid lookup chooses the K_active experts per token,
+        // but the WEIGHTS are still derived from the gate matmul + sqrtsoftplus
+        // (reference Gate.forward, model.py:564). For hash layers, the gate
+        // weight is stored as raw BF16 (not quantized) — q4_matmul would zero
+        // out the output because scales/biases don't exist.
         int top_indices[16];
         float top_weights[16];
 
+        // 1. Compute gate scores via plain BF16 matmul.
+        size_t gw_sz;
+        const void *gate_w_bf16 = model_get_weight(ctx->model, name, &gw_sz);
+        if (gate_w_bf16 && gw_sz == (size_t)num_experts * (size_t)H * sizeof(uint16_t)) {
+            const uint16_t *W = gate_w_bf16;
+            for (int e = 0; e < num_experts; e++) {
+                float dot = 0.0f;
+                const uint16_t *row = W + (size_t)e * (size_t)H;
+                for (int k = 0; k < H; k++)
+                    dot += bf16_to_f32(row[k]) * ctx->norm_out[k];
+                ctx->gate_logits[e] = dot;
+            }
+        } else {
+            // Fall back to the quantized path in case the converter ever
+            // packs hash-layer gates as q4.
+            q4_matmul(ctx, ctx->gate_logits, ctx->norm_out, name, sname, bname,
+                      num_experts, H, 64);
+        }
+        float *hash_probs = arena_alloc(&ctx->arena,
+                                        (size_t)num_experts * sizeof(float));
+        v4_sqrtsoftplus_gate(hash_probs, ctx->gate_logits, num_experts);
+
+        // 2. Look up the K_active expert indices for this token.
         char tid_name[128];
         snprintf(tid_name, sizeof(tid_name), "layers.%d.ffn.gate.tid2eid", layer_idx);
         size_t tid_size;
         const void *tid2eid = model_get_weight(ctx->model, tid_name, &tid_size);
         if (tid2eid && token_id >= 0 && token_id < cfg->vocab_size) {
             const int64_t *table = (const int64_t *)tid2eid;
-            float w = 1.0f / (float)K_active;
             for (int k = 0; k < K_active && k < 16; k++) {
-                top_indices[k] = (int)table[token_id * K_active + k];
-                top_weights[k] = w;
+                int idx = (int)table[token_id * K_active + k];
+                top_indices[k] = idx;
+                top_weights[k] = (idx >= 0 && idx < num_experts)
+                    ? hash_probs[idx] : 0.0f;
             }
         } else {
             LOG_WARN("v4: tid2eid missing for layer %d, token %d", layer_idx, token_id);
             for (int k = 0; k < K_active && k < 16; k++) {
                 top_indices[k] = k;
-                top_weights[k] = 1.0f / (float)K_active;
+                top_weights[k] = hash_probs[k];
             }
         }
+
+        // 3. Renormalize so weights sum to 1, then scale by route_scale.
+        float wsum = 0.0f;
+        for (int k = 0; k < K_active; k++) wsum += top_weights[k];
+        float route_scale = (float)cfg->v4.route_scale;
+        if (route_scale == 0.0f) route_scale = 1.0f;
+        if (wsum > 0.0f)
+            for (int k = 0; k < K_active; k++)
+                top_weights[k] = (top_weights[k] / wsum) * route_scale;
 
         // Shared expert FFN (same as standard path, CPU)
         int hr_dim = cfg->shared_expert_intermediate_size;
@@ -990,13 +1058,7 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
         snprintf(bname, sizeof(bname), "layers.%d.ffn.shared_experts.up_proj.biases", layer_idx);
         q4_matmul(ctx, hr_up, ctx->norm_out, name, sname, bname, hr_dim, H, 64);
 
-        for (int i = 0; i < hr_dim; i++) {
-            if (hr_gate[i] > 10.0f) hr_gate[i] = 10.0f;
-            if (hr_gate[i] < -10.0f) hr_gate[i] = -10.0f;
-            if (hr_up[i] > 10.0f) hr_up[i] = 10.0f;
-            if (hr_up[i] < -10.0f) hr_up[i] = -10.0f;
-        }
-
+        // Shared expert has swiglu_limit=0 (no clamp) per reference model.py:628.
         cpu_silu_mul(hr_mid, hr_gate, hr_up, hr_dim);
 
         snprintf(name, sizeof(name), "layers.%d.ffn.shared_experts.down_proj.weight", layer_idx);
@@ -1033,11 +1095,11 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
             float *r_up = arena_alloc(&ctx->arena, (size_t)hr_dim * sizeof(float));
             dequant_matmul_mxfp4(r_up, uw, us, ctx->norm_out, hr_dim, H, hr_gs);
 
+            // Routed expert: gate clamped MAX-only, up symmetric (model.py:601).
             for (int i = 0; i < hr_dim; i++) {
                 if (r_gate[i] > 10.0f) r_gate[i] = 10.0f;
-                if (r_gate[i] < -10.0f) r_gate[i] = -10.0f;
-                if (r_up[i] > 10.0f) r_up[i] = 10.0f;
-                if (r_up[i] < -10.0f) r_up[i] = -10.0f;
+                if (r_up[i]   >  10.0f) r_up[i]   =  10.0f;
+                if (r_up[i]   < -10.0f) r_up[i]   = -10.0f;
             }
 
             float *r_mid = arena_alloc(&ctx->arena, (size_t)hr_dim * sizeof(float));
