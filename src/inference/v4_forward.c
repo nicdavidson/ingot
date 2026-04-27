@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "inference/v4_forward.h"
+#include "inference/v4_compressor.h"
 #include "inference/dequant.h"
 #include "model/mmap_pool.h"
 #include "util/log.h"
@@ -31,6 +32,7 @@ struct V4InferenceContext {
     InferenceCache   *cache;
     AttentionGPU     *attn_gpu;
     Arena             arena;
+    V4Compressor     *compressor;
 
     // Hyper-connection state: 4 copies of hidden state, persistent across layers
     float *hc_state;      // [hc_mult * hidden_size]
@@ -451,6 +453,13 @@ V4InferenceContext *v4_inference_create(Model *model, const ModelConfig *cfg,
     ctx->attn_gpu = attn_gpu;
     ctx->arena = arena_create(64 * 1024 * 1024);
 
+    // Compressor stores rolling state + compressed-KV cache for layers with
+    // compress_ratio > 0. Cap to 4096 max_seq for testing — real serving will
+    // need this sized off cache->kv_layers[0].max_seq, but the smaller cap
+    // keeps startup memory sane and avoids allocating 300+ MB of unused cache
+    // for short prompts.
+    ctx->compressor = v4_compressor_create(cfg, 4096);
+
     int H = cfg->hidden_size;
     int M = cfg->v4.hc_mult;
 
@@ -620,6 +629,31 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
     bf16_to_float_vec(norm_weight, norm_bf16, H);
     cpu_rmsnorm(ctx->norm_out, ctx->sublayer_in, norm_weight, H, cfg->rms_norm_eps);
 
+    // Compressor (CSA: ratio=4 / HCA: ratio=128). Updates rolling window
+    // buffers each token and emits a new compressed-KV entry every `ratio`
+    // tokens. Operates on the SAME post-attn_norm hidden as the attention
+    // wkv projection (matches reference Attention.forward).
+    int compressed_count = 0;
+    const float *compressed_kv = NULL;
+    if (cfg->v4.compress_ratios && cfg->v4.compress_ratios[layer_idx] > 0) {
+        v4_compressor_step(ctx->compressor, ctx->model, cfg, layer_idx,
+                           ctx->norm_out, position);
+        compressed_kv = v4_compressor_cache(ctx->compressor, layer_idx,
+                                            &compressed_count);
+        if (layer_idx == 2 && (position == 3 || position == 7 || position == 11)) {
+            float ss = 0.0f; int nan = 0;
+            int n = compressed_count * cfg->head_dim;
+            for (int i = 0; i < n; i++) {
+                float v = compressed_kv[i];
+                if (!(v == v)) nan++;
+                ss += v * v;
+            }
+            LOG_INFO("v4_compressor diag: L%d pos=%d compressed_count=%d rms=%.4f nan=%d",
+                     layer_idx, position, compressed_count,
+                     n > 0 ? sqrtf(ss / n) : 0.0f, nan);
+        }
+    }
+
     // Attention forward pass (MLA)
 #ifdef PLATFORM_MACOS
     if (ctx->use_gpu)
@@ -628,7 +662,8 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
 
     attention_v4_mla_forward(ctx->sublayer_out, ctx->norm_out, ctx->model, cfg,
                              ctx->cache, ctx->attn_gpu,
-                             layer_idx, ctx->kv_idx, position);
+                             layer_idx, ctx->kv_idx, position,
+                             compressed_kv, compressed_count);
     ctx->kv_idx++;
 
     // HC post for attention: updates hc_state using sublayer_out
@@ -1213,6 +1248,14 @@ void v4_inference_free(V4InferenceContext *ctx) {
     free(ctx->expert_out);
     free(ctx->expert_buf);
     free(ctx->logits_buf);
+    v4_compressor_free(ctx->compressor);
     arena_destroy(&ctx->arena);
     free(ctx);
+}
+
+void v4_reset_state(V4InferenceContext *v4) {
+    if (!v4) return;
+    v4_compressor_reset(v4->compressor);
+    // hc_state is reinitialized at the start of every token via v4_init_hc_state,
+    // so it doesn't need an explicit reset here.
 }

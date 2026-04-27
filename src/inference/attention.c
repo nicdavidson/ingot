@@ -1099,7 +1099,8 @@ void attention_v4_mla_forward(
     float *attn_out, const float *hidden,
     const Model *model, const ModelConfig *cfg,
     InferenceCache *cache, AttentionGPU *gpu,
-    int layer_idx, int kv_layer_idx, int position)
+    int layer_idx, int kv_layer_idx, int position,
+    const float *compressed_kv, int compressed_count)
 {
     int H = cfg->hidden_size;
     int num_heads = cfg->num_attention_heads;
@@ -1241,12 +1242,18 @@ void attention_v4_mla_forward(
     const void *attn_sink_raw = model_get_weight(model, sink_name, &sink_sz);
     const float *attn_sink = (const float *)attn_sink_raw;
 
-    float *head_out = calloc((size_t)q_dim, sizeof(float));
-    float *scores = calloc((size_t)seq_len, sizeof(float));
+    int n_window = seq_len - window_start;
+    int n_total  = n_window + compressed_count;
+
+    float *head_out      = calloc((size_t)q_dim, sizeof(float));
+    float *win_scores    = calloc((size_t)(n_window > 0 ? n_window : 1), sizeof(float));
+    float *comp_scores   = compressed_count > 0
+        ? calloc((size_t)compressed_count, sizeof(float)) : NULL;
 
     for (int h = 0; h < num_heads; h++) {
         const float *qi = q + h * head_dim;
 
+        // Score window slots.
         for (int t = window_start; t < seq_len; t++) {
             const float *kt = cached_k + (size_t)t * (size_t)head_dim;
             float dot = 0.0f;
@@ -1255,33 +1262,57 @@ void attention_v4_mla_forward(
 #else
             for (int d = 0; d < head_dim; d++) dot += qi[d] * kt[d];
 #endif
-            scores[t] = dot * scale;
+            win_scores[t - window_start] = dot * scale;
         }
 
-        // Online softmax with attn_sink as a virtual position with zero value.
+        // Score compressed slots (each is a single head_dim vector, used as
+        // both K and V for the V4 absorbed-projection trick).
+        for (int c = 0; c < compressed_count; c++) {
+            const float *kc = compressed_kv + (size_t)c * (size_t)head_dim;
+            float dot = 0.0f;
+#ifdef PLATFORM_MACOS
+            vDSP_dotpr(qi, 1, kc, 1, &dot, (vDSP_Length)head_dim);
+#else
+            for (int d = 0; d < head_dim; d++) dot += qi[d] * kc[d];
+#endif
+            comp_scores[c] = dot * scale;
+        }
+
+        // Online softmax over (window ⊕ compressed) with attn_sink as a
+        // virtual zero-value slot in the denominator.
         float max_v = attn_sink ? attn_sink[h] : -1e30f;
-        for (int t = window_start; t < seq_len; t++)
-            if (scores[t] > max_v) max_v = scores[t];
+        for (int i = 0; i < n_window; i++)
+            if (win_scores[i] > max_v) max_v = win_scores[i];
+        for (int c = 0; c < compressed_count; c++)
+            if (comp_scores[c] > max_v) max_v = comp_scores[c];
 
         float denom = 0.0f;
-        for (int t = window_start; t < seq_len; t++) {
-            scores[t] = expf(scores[t] - max_v);
-            denom += scores[t];
+        for (int i = 0; i < n_window; i++) {
+            win_scores[i] = expf(win_scores[i] - max_v);
+            denom += win_scores[i];
+        }
+        for (int c = 0; c < compressed_count; c++) {
+            comp_scores[c] = expf(comp_scores[c] - max_v);
+            denom += comp_scores[c];
         }
         if (attn_sink)
-            denom += expf(attn_sink[h] - max_v);   // sink only adds to denom
+            denom += expf(attn_sink[h] - max_v);
         float inv_denom = 1.0f / denom;
-        for (int t = window_start; t < seq_len; t++)
-            scores[t] *= inv_denom;
+        for (int i = 0; i < n_window; i++)        win_scores[i]  *= inv_denom;
+        for (int c = 0; c < compressed_count; c++) comp_scores[c] *= inv_denom;
 
         float *out_h = head_out + h * head_dim;
         for (int d = 0; d < head_dim; d++) {
             float sum = 0.0f;
-            for (int t = window_start; t < seq_len; t++)
-                sum += scores[t] * cached_v[(size_t)t * (size_t)head_dim + d];
+            for (int i = 0; i < n_window; i++)
+                sum += win_scores[i] * cached_v[(size_t)(window_start + i) * (size_t)head_dim + d];
+            for (int c = 0; c < compressed_count; c++)
+                sum += comp_scores[c] * compressed_kv[(size_t)c * (size_t)head_dim + d];
             out_h[d] = sum;
         }
     }
+    (void)n_total;
+    free(comp_scores);
 
     // 7b. Output-side RoPE inverse on the last qk_rope_dim of each head.
     // Reference: apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True).
@@ -1299,7 +1330,7 @@ void attention_v4_mla_forward(
     }
 
     free(q);
-    free(scores);
+    free(win_scores);
 
     // 8. O projection (grouped LoRA)
     // head_out [64, 512] → [8 groups of 4096] → per-group wo_a → concat → wo_b

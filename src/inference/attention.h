@@ -43,4 +43,34 @@ void attention_deltanet_forward(
     int          position
 );
 
+
+// DeepSeek V4 MLA (Multi-head Latent Attention) forward pass.
+// Uses LoRA-compressed Q (wq_a/wq_b) and single-head KV latent (wkv).
+// Output projection is grouped LoRA (wo_a/wo_b with o_groups).
+//
+// compressed_kv (optional, may be NULL): [compressed_count, head_dim] —
+// pre-RoPE'd compressed KV positions to attend to in addition to the
+// windowed KV cache. Produced by V4Compressor for layers with
+// compress_ratio > 0.
+void attention_v4_mla_forward(
+    float       *attn_out,     // [hidden_size] output
+    const float *hidden,       // [hidden_size] input
+    const Model *model,
+    const ModelConfig *cfg,
+    InferenceCache *cache,
+    AttentionGPU *gpu,         // reusable GPU buffers (may be NULL)
+    int          layer_idx,
+    int          kv_layer_idx,
+    int          position,
+    const float *compressed_kv,
+    int          compressed_count
+);
+
+
+// DeltaNet per-token timing report (macOS only, no-op elsewhere)
+#ifdef PLATFORM_MACOS
+void attention_dn_timing_report(int token_num);
+#else
+static inline void attention_dn_timing_report(int token_num) { (void)token_num; }
+#endif
 #endif

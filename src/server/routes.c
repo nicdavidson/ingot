@@ -292,6 +292,7 @@ static void handle_chat_completions(int fd, const HttpRequest *req, Model *model
     } else {
         // Cache miss — reset and compute new prefix
         cache_reset(inference_get_cache(g_ictx));
+        inference_reset_v4_state(g_ictx);
 
         // Try to compute and cache the prefix for future requests
         int32_t *new_prefix_tokens = NULL;

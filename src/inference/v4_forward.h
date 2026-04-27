@@ -32,6 +32,10 @@ void v4_compute_logits(V4InferenceContext *v4, float *out_logits);
 // Free V4 context.
 void v4_inference_free(V4InferenceContext *v4);
 
+// Reset per-conversation state (currently: clear the compressor's rolling
+// window buffers and compressed-KV caches). Call when the KV cache is reset.
+void v4_reset_state(V4InferenceContext *v4);
+
 // V4 timing instrumentation
 void v4_timing_reset(void);
 void v4_timing_report(int token_num);

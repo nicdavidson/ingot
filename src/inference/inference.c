@@ -5,6 +5,7 @@
 #include "inference/kv_cache.h"
 #include "inference/sampler.h"
 #include "inference/dequant.h"
+#include "inference/v4_forward.h"
 #include "config/config.h"
 #include "model/mmap_pool.h"
 #include "util/log.h"
@@ -15,12 +16,17 @@
 #include "compute/kernels.h"
 #include "compute/metal_context.h"
 #include "model/expert_io.h"
+#include <Accelerate/Accelerate.h>
 #endif
 
 #include <alloca.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 // Scratch buffers for a single forward pass
 typedef struct {
@@ -62,6 +68,7 @@ struct InferenceContext {
     void           *gpu_up_out;    // Metal buffer for expert up_proj output
     void           *gpu_ffn_mid;   // Metal buffer for SiLU(gate)*up intermediate
     void           *gpu_expert_result; // Metal buffer for expert down_proj output
+    void           *gpu_gate_logits;   // Metal buffer for MoE gate output [num_experts]
     float          *cpu_gate_out;  // CPU pointer into gpu_gate_out
     float          *cpu_up_out;
     float          *cpu_ffn_mid;
@@ -78,17 +85,31 @@ struct InferenceContext {
     size_t          expert_staging_size;      // bytes per staging buffer
     ExpertIO       *expert_io;               // GCD parallel pread subsystem
     // Deferred expert completion from previous layer
-    void           *prev_expert_signal;      // dispatch_semaphore from deferred batch
+    void           *prev_expert_signal;      // dispatch_semaphore from deferred batch (routed)
     float           prev_expert_weights[16]; // weights for pending accumulation
     int             prev_expert_count;       // number of pending experts
+    // Deferred shared expert from previous layer
+    void           *prev_shared_signal;      // dispatch_semaphore for shared expert
+    float           prev_shared_gate;        // sigmoid gate value for shared expert
     bool            use_gpu;
 #endif
+
+    // V4 sub-context (NULL for Qwen models)
+    V4InferenceContext *v4;
 };
 
 static void alloc_scratch(ScratchBuffers *s, const ModelConfig *cfg, int max_seq) {
     s->hidden      = calloc((size_t)cfg->hidden_size, sizeof(float));
     s->residual    = calloc((size_t)cfg->hidden_size, sizeof(float));
-    s->norm_out    = calloc((size_t)cfg->hidden_size, sizeof(float));
+    {
+        int _max_in = cfg->hidden_size;
+        int _swa = cfg->num_attention_heads * cfg->head_dim;
+        int _dn = cfg->linear_attn.linear_num_value_heads *
+                  cfg->linear_attn.linear_value_head_dim;
+        if (_swa > _max_in) _max_in = _swa;
+        if (_dn > _max_in) _max_in = _dn;
+        s->norm_out = calloc((size_t)_max_in, sizeof(float));
+    }
     s->q           = calloc((size_t)cfg->num_attention_heads * (size_t)cfg->head_dim, sizeof(float));
     s->k           = calloc((size_t)cfg->num_key_value_heads * (size_t)cfg->head_dim, sizeof(float));
     s->v           = calloc((size_t)cfg->num_key_value_heads * (size_t)cfg->head_dim, sizeof(float));
@@ -124,7 +145,7 @@ InferenceContext *inference_create(Model *model) {
     const ModelConfig *cfg = model_config(model);
 
     // For v1: limit context to 8K to keep memory reasonable
-    int max_seq = 8192;
+    int max_seq = 32768;
     if (max_seq > cfg->max_position_embeddings)
         max_seq = cfg->max_position_embeddings;
 
@@ -139,8 +160,15 @@ InferenceContext *inference_create(Model *model) {
     if (ctx->metal && ctx->shared_buf) {
         int H = cfg->hidden_size;
         int max_out = cfg->vocab_size > H ? cfg->vocab_size : H;
+        // Compute max projection input dimension (o_proj inputs can be > hidden_size)
+        int swa_oproj_in = cfg->num_attention_heads * cfg->head_dim;
+        int dn_oproj_in = cfg->linear_attn.linear_num_value_heads *
+                          cfg->linear_attn.linear_value_head_dim;
+        int max_proj_in = H;
+        if (swa_oproj_in > max_proj_in) max_proj_in = swa_oproj_in;
+        if (dn_oproj_in > max_proj_in) max_proj_in = dn_oproj_in;
         ctx->gpu_hidden   = metal_alloc_buffer(ctx->metal, (size_t)H * sizeof(float));
-        ctx->gpu_norm_out  = metal_alloc_buffer(ctx->metal, (size_t)H * sizeof(float));
+        ctx->gpu_norm_out  = metal_alloc_buffer(ctx->metal, (size_t)max_proj_in * sizeof(float));
         ctx->gpu_out       = metal_alloc_buffer(ctx->metal, (size_t)max_out * sizeof(float));
         ctx->gpu_logits    = metal_alloc_buffer(ctx->metal, (size_t)cfg->vocab_size * sizeof(float));
 
@@ -152,17 +180,21 @@ InferenceContext *inference_create(Model *model) {
         ctx->gpu_up_out        = metal_alloc_buffer(ctx->metal, (size_t)expert_dim * sizeof(float));
         ctx->gpu_ffn_mid       = metal_alloc_buffer(ctx->metal, (size_t)expert_dim * sizeof(float));
         ctx->gpu_expert_result = metal_alloc_buffer(ctx->metal, (size_t)H * sizeof(float));
+        ctx->gpu_gate_logits   = metal_alloc_buffer(ctx->metal, (size_t)cfg->num_experts * sizeof(float));
 
         if (ctx->gpu_hidden && ctx->gpu_norm_out && ctx->gpu_out && ctx->gpu_logits &&
-            ctx->gpu_gate_out && ctx->gpu_up_out && ctx->gpu_ffn_mid && ctx->gpu_expert_result) {
+            ctx->gpu_gate_out && ctx->gpu_up_out && ctx->gpu_ffn_mid && ctx->gpu_expert_result &&
+            ctx->gpu_gate_logits) {
             // Point scratch arrays at the GPU buffer contents (unified memory)
             free(ctx->scratch.hidden);
             free(ctx->scratch.norm_out);
             free(ctx->scratch.logits);
             ctx->scratch.hidden   = metal_buffer_contents(ctx->gpu_hidden);
             ctx->scratch.norm_out = metal_buffer_contents(ctx->gpu_norm_out);
-            ctx->scratch.logits   = metal_buffer_contents(ctx->gpu_logits);
-            ctx->cpu_gate_out      = metal_buffer_contents(ctx->gpu_gate_out);
+            ctx->scratch.logits      = metal_buffer_contents(ctx->gpu_logits);
+            free(ctx->scratch.gate_logits);
+            ctx->scratch.gate_logits = metal_buffer_contents(ctx->gpu_gate_logits);
+            ctx->cpu_gate_out        = metal_buffer_contents(ctx->gpu_gate_out);
             ctx->cpu_up_out        = metal_buffer_contents(ctx->gpu_up_out);
             ctx->cpu_ffn_mid       = metal_buffer_contents(ctx->gpu_ffn_mid);
             ctx->cpu_expert_result = metal_buffer_contents(ctx->gpu_expert_result);
@@ -195,7 +227,7 @@ InferenceContext *inference_create(Model *model) {
             if (max_stride > 0) {
                 bool staging_ok = true;
                 for (int i = 0; i < K_max; i++) {
-                    ctx->gpu_expert_staging[i] = metal_alloc_buffer(ctx->metal, max_stride);
+                    ctx->gpu_expert_staging[i] = metal_alloc_buffer_aligned(ctx->metal, max_stride, 2 * 1024 * 1024);
                     if (ctx->gpu_expert_staging[i]) {
                         ctx->cpu_expert_staging[i] = metal_buffer_contents(
                             ctx->gpu_expert_staging[i]);
@@ -217,6 +249,12 @@ InferenceContext *inference_create(Model *model) {
     }
 #endif
 
+    // Create V4 sub-context if this is a DeepSeek V4 model
+    if (cfg->arch == ARCH_DEEPSEEK_V4) {
+        ctx->v4 = v4_inference_create(model, cfg, ctx->cache, ctx->attn_gpu);
+        LOG_INFO("inference: V4 forward path enabled");
+    }
+
     LOG_INFO("inference: context created (max_seq=%d)", max_seq);
     return ctx;
 }
@@ -236,9 +274,8 @@ static void complete_deferred_experts(InferenceContext *ctx) {
     for (int k = 0; k < ctx->prev_expert_count; k++) {
         float weight = ctx->prev_expert_weights[k];
         float *result = ctx->cpu_result_slots[k];
-        for (int i = 0; i < H; i++) {
-            s->hidden[i] += weight * result[i];
-        }
+        // Vectorized weighted accumulation: hidden += weight * result
+        vDSP_vsma(result, 1, &weight, s->hidden, 1, s->hidden, 1, (vDSP_Length)H);
     }
     ctx->prev_expert_count = 0;
 }
@@ -248,10 +285,19 @@ static void complete_deferred_experts(InferenceContext *ctx) {
 
 static void cpu_rmsnorm(float *out, const float *x, const float *weight,
                         int n, float eps) {
+#ifdef PLATFORM_MACOS
+    // Use Accelerate: vDSP_svesq for sum-of-squares, vDSP_vsmul + vDSP_vmul
+    float ss;
+    vDSP_svesq(x, 1, &ss, (vDSP_Length)n);
+    float inv_rms = 1.0f / sqrtf(ss / (float)n + eps);
+    vDSP_vsmul(x, 1, &inv_rms, out, 1, (vDSP_Length)n);
+    vDSP_vmul(out, 1, weight, 1, out, 1, (vDSP_Length)n);
+#else
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
     float rms = sqrtf(ss / (float)n + eps);
     for (int i = 0; i < n; i++) out[i] = (x[i] / rms) * weight[i];
+#endif
 }
 
 static void cpu_softmax(float *x, int n) {
@@ -326,6 +372,7 @@ static void cpu_attention(float *out, const float *q, const float *k_cache,
 
 // Helper: quantized matmul using weight name lookup
 // Uses GPU when available, falls back to CPU.
+// Small matmuls (M < 512) skip GPU — CB overhead dominates for tiny outputs.
 static void q4_matmul(InferenceContext *ctx, float *out, const float *x,
                       const char *w_name, const char *s_name, const char *b_name,
                       int M, int K, int group_size) {
@@ -345,7 +392,8 @@ static void q4_matmul(InferenceContext *ctx, float *out, const float *x,
             void *out_buf = NULL;
             if (out == ctx->scratch.hidden)   out_buf = ctx->gpu_hidden;
             if (out == ctx->scratch.norm_out) out_buf = ctx->gpu_norm_out;
-            if (out == ctx->scratch.logits)   out_buf = ctx->gpu_logits;
+            if (out == ctx->scratch.logits)      out_buf = ctx->gpu_logits;
+            if (out == ctx->scratch.gate_logits) out_buf = ctx->gpu_gate_logits;
 
             if (x_buf && out_buf) {
                 kernel_matmul_q4_fma_offsets(ctx->metal, ctx->shared_buf,
@@ -372,26 +420,64 @@ static void q4_matmul(InferenceContext *ctx, float *out, const float *x,
     dequant_matmul_q4(out, w, s, b, x, M, K, group_size);
 }
 
-// Convert BF16 norm weight to float
+// Convert BF16 norm weight to float (NEON vectorized on ARM)
 static void bf16_to_float_vec(float *out, const void *bf16_data, int n) {
     const uint16_t *src = bf16_data;
+#ifdef __ARM_NEON
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        uint16x8_t v = vld1q_u16(src + i);
+        uint32x4_t lo = vshll_n_u16(vget_low_u16(v), 16);
+        uint32x4_t hi = vshll_n_u16(vget_high_u16(v), 16);
+        vst1q_f32(out + i, vreinterpretq_f32_u32(lo));
+        vst1q_f32(out + i + 4, vreinterpretq_f32_u32(hi));
+    }
+    for (; i < n; i++) out[i] = bf16_to_f32(src[i]);
+#else
     for (int i = 0; i < n; i++) {
         out[i] = bf16_to_f32(src[i]);
     }
+#endif
 }
 
+
+// Debug diagnostic for value tracking
+static float _diag_rms(const float *x, int n) {
+    float ss = 0;
+    for (int i = 0; i < n; i++) ss += x[i] * x[i];
+    return sqrtf(ss / (float)n);
+}
+int _diag_first_token = 1;  // non-static: attention.c references this via extern
+#define DIAG(label, buf, n) if (_diag_first_token && (layer_idx <= 2 || layer_idx == 10 || (layer_idx >= 20 && layer_idx <= 32) || layer_idx == 40 || layer_idx == 59)) \
+    fprintf(stderr, "[DIAG L%d] %s: rms=%.6f [%.4f,%.4f,%.4f,%.4f]\n", layer_idx, label, _diag_rms(buf,n), (buf)[0], (buf)[1], (buf)[2], (buf)[3])
+
 // --- Forward pass ---
+
+// Per-token timing accumulators
+static double _acc_deferred = 0, _acc_attn = 0, _acc_norm = 0, _acc_shared = 0, _acc_routed = 0;
+static void _timing_reset(void) { _acc_deferred = _acc_attn = _acc_norm = _acc_shared = _acc_routed = 0; }
+static void _timing_report(int token_num) {
+    double total = _acc_deferred + _acc_attn + _acc_norm + _acc_shared + _acc_routed;
+    fprintf(stderr, "[TIMING tok%d] deferred=%.1f attn=%.1f norm=%.1f shared=%.1f routed=%.1f TOTAL=%.1f ms\n",
+            token_num, _acc_deferred, _acc_attn, _acc_norm, _acc_shared, _acc_routed, total);
+}
 
 static void forward_layer(InferenceContext *ctx, int layer_idx) {
     const ModelConfig *cfg = model_config(ctx->model);
     ScratchBuffers *s = &ctx->scratch;
     int H = cfg->hidden_size;
+    uint64_t _t0 = timer_now_ns(), _t1;
+    double _ms_deferred = 0;
 
     // Complete deferred expert accumulation from previous layer.
     // This blocks until the previous layer's expert GPU work finishes.
     // The current layer's attention can't start until we have the correct hidden state.
 #ifdef PLATFORM_MACOS
     complete_deferred_experts(ctx);
+    if (_diag_first_token && (layer_idx <= 2 || layer_idx == 10 || (layer_idx >= 20 && layer_idx <= 32) || layer_idx == 40 || layer_idx == 59))
+        fprintf(stderr, "[DIAG L%d] after deferred_experts: rms=%.6f [%.4f,%.4f,%.4f,%.4f]\n",
+                layer_idx, _diag_rms(s->hidden, H), s->hidden[0], s->hidden[1], s->hidden[2], s->hidden[3]);
+    _t1 = timer_now_ns(); _ms_deferred = timer_elapsed_ms(_t0, _t1); _t0 = _t1;
 #endif
 
     // Get layer norm weight (BF16 → float)
@@ -407,6 +493,7 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     // 1. Pre-attention RMSNorm
     memcpy(s->residual, s->hidden, (size_t)H * sizeof(float));
     cpu_rmsnorm(s->norm_out, s->hidden, norm_weight, H, cfg->rms_norm_eps);
+    DIAG("after input_norm", s->norm_out, H);
 
     // 2-9. Attention (SWA or DeltaNet depending on layer type)
     float *attn_result = arena_alloc(&ctx->arena, (size_t)H * sizeof(float));
@@ -429,10 +516,16 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
         ctx->dn_idx++;
     }
 
-    // Add attention output to residual
+    // Add attention output to residual (vectorized)
+#ifdef PLATFORM_MACOS
+    vDSP_vadd(s->residual, 1, attn_result, 1, s->hidden, 1, (vDSP_Length)H);
+#else
     for (int i = 0; i < H; i++) {
         s->hidden[i] = s->residual[i] + attn_result[i];
     }
+#endif
+    DIAG("after attn+residual", s->hidden, H);
+    _t1 = timer_now_ns(); double _ms_attn = timer_elapsed_ms(_t0, _t1); _t0 = _t1;
 
     // 10. Post-attention layernorm
     // Save post-attention hidden as new residual for MLP block
@@ -443,6 +536,8 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
         bf16_to_float_vec(norm_weight, post_norm_bf16, H);
         cpu_rmsnorm(s->norm_out, s->hidden, norm_weight, H, cfg->rms_norm_eps);
     }
+    DIAG("after post_attn_norm", s->norm_out, H);
+    _t1 = timer_now_ns(); double _ms_norm = timer_elapsed_ms(_t0, _t1); _t0 = _t1;
 
     // 11. MoE gate: gate_logits = norm_out @ gate_weight
     int num_experts = cfg->num_experts;
@@ -572,11 +667,13 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
             kernel_end_batch(batch);
             memcpy(s->expert_out, ctx->cpu_expert_result, (size_t)H * sizeof(float));
             shared_on_gpu = true;
+            if (_diag_first_token && layer_idx == 0) fprintf(stderr, "[DIAG] shared expert GPU path ACTIVE\n");
         }
     }
 #endif
 
     if (!shared_on_gpu) {
+        if (_diag_first_token && layer_idx == 0) fprintf(stderr, "[DIAG] shared expert CPU fallback\n");
         snprintf(name, sizeof(name), "layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
         snprintf(sname, sizeof(sname), "layers.%d.mlp.shared_expert.gate_proj.scales", layer_idx);
         snprintf(bname, sizeof(bname), "layers.%d.mlp.shared_expert.gate_proj.biases", layer_idx);
@@ -604,8 +701,21 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     q4_matmul(ctx, &gate_scalar, s->norm_out, name, sname, bname, 1, H, 64);
     shared_gate_val = 1.0f / (1.0f + expf(-gate_scalar)); // sigmoid
 
-    // Add gated shared expert output to residual
+    // DEBUG: check shared expert output before gating
+    if (_diag_first_token) {
+        fprintf(stderr, "[DIAG L%d] shared_expert FFN out rms=%.6f gate_scalar=%.4f sigmoid=%.4f residual_rms=%.6f\n",
+                layer_idx, _diag_rms(s->expert_out, H), gate_scalar, shared_gate_val, _diag_rms(s->residual, H));
+    }
+
+    // Add gated shared expert output to residual (vectorized)
+#ifdef PLATFORM_MACOS
+    memcpy(s->hidden, s->residual, (size_t)H * sizeof(float));
+    vDSP_vsma(s->expert_out, 1, &shared_gate_val, s->hidden, 1, s->hidden, 1, (vDSP_Length)H);
+#else
     for (int i = 0; i < H; i++) s->hidden[i] = s->residual[i] + shared_gate_val * s->expert_out[i];
+#endif
+    DIAG("after shared expert+gate", s->hidden, H);
+    _t1 = timer_now_ns(); double _ms_shared = timer_elapsed_ms(_t0, _t1); _t0 = _t1;
 
     // 14. Routed experts
     moe_dim = cfg->moe_intermediate_size;
@@ -632,7 +742,9 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
     if (ctx->use_gpu && K_active <= ctx->num_expert_slots && pread_experts) {
         // pread-based path: expert data is in staging buffers (Metal unified memory)
         // Wait for parallel pread() to complete
+        uint64_t _pread_t0 = timer_now_ns();
         expert_io_wait(ctx->expert_io);
+        uint64_t _pread_t1 = timer_now_ns();
 
         void *batch = kernel_begin_batch(ctx->metal);
         int batch_count = 0;
@@ -669,6 +781,11 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
         }
 
         ctx->prev_expert_signal = kernel_end_batch_deferred(batch);
+        uint64_t _gpu_t1 = timer_now_ns();
+        if (_diag_first_token && layer_idx < 4)
+            fprintf(stderr, "[EXPERT-TIMING L%d] pread_wait=%.2f gpu_setup=%.2f ms\n",
+                    layer_idx, timer_elapsed_ms(_pread_t0, _pread_t1),
+                    timer_elapsed_ms(_pread_t1, _gpu_t1));
         for (int k = 0; k < batch_count; k++) {
             ctx->prev_expert_weights[k] = top_weights[k];
         }
@@ -754,9 +871,13 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
             float *expert_result = arena_alloc(&ctx->arena, (size_t)H * sizeof(float));
             dequant_matmul_q4(expert_result, dw, ds, ptr, ffn_mid, H, moe_dim, group_size);
 
+#ifdef PLATFORM_MACOS
+            vDSP_vsma(expert_result, 1, &weight, s->hidden, 1, s->hidden, 1, (vDSP_Length)H);
+#else
             for (int i = 0; i < H; i++) {
                 s->hidden[i] += weight * expert_result[i];
             }
+#endif
         }
     }
 
@@ -777,9 +898,17 @@ static void forward_layer(InferenceContext *ctx, int layer_idx) {
         if (pf) mmap_pool_prefetch((void *)pf, pf_size);
     }
 
+    _t1 = timer_now_ns(); double _ms_routed = timer_elapsed_ms(_t0, _t1);
+    _acc_deferred += _ms_deferred; _acc_attn += _ms_attn; _acc_norm += _ms_norm;
+    _acc_shared += _ms_shared; _acc_routed += _ms_routed;
+    if (_diag_first_token && (layer_idx <= 2 || layer_idx == 59))
+        fprintf(stderr, "[TIMING L%d] deferred=%.2f attn=%.2f norm=%.2f shared=%.2f routed=%.2f total=%.2f ms\n",
+                layer_idx, _ms_deferred, _ms_attn, _ms_norm, _ms_shared, _ms_routed,
+                _ms_deferred + _ms_attn + _ms_norm + _ms_shared + _ms_routed);
     arena_reset(&ctx->arena);
 }
 
+static int _embed_diag = 0;
 static void embed_token(InferenceContext *ctx, int32_t token_id) {
     const ModelConfig *cfg = model_config(ctx->model);
     size_t ws, ss, bs;
@@ -794,14 +923,21 @@ static void embed_token(InferenceContext *ctx, int32_t token_id) {
 
     int K = cfg->hidden_size;
     int group_size = 64;
-    int K_packed = K / 8;
     int num_groups = K / group_size;
 
-    const uint32_t *row_w = (const uint32_t *)emb_w + (size_t)token_id * K_packed;
-    const uint16_t *row_s = (const uint16_t *)emb_s + (size_t)token_id * num_groups;
-    const uint16_t *row_b = (const uint16_t *)emb_b + (size_t)token_id * num_groups;
-
-    dequant_row_q4(ctx->scratch.hidden, row_w, row_s, row_b, K, group_size);
+    if (cfg->arch == ARCH_DEEPSEEK_V4) {
+        int K_packed_q6 = K * 6 / 32;
+        const uint32_t *row_w = (const uint32_t *)emb_w + (size_t)token_id * K_packed_q6;
+        const uint16_t *row_s = (const uint16_t *)emb_s + (size_t)token_id * num_groups;
+        const uint16_t *row_b = (const uint16_t *)emb_b + (size_t)token_id * num_groups;
+        dequant_row_q6(ctx->scratch.hidden, row_w, row_s, row_b, K, group_size);
+    } else {
+        int K_packed_q4 = K / 8;
+        const uint32_t *row_w = (const uint32_t *)emb_w + (size_t)token_id * K_packed_q4;
+        const uint16_t *row_s = (const uint16_t *)emb_s + (size_t)token_id * num_groups;
+        const uint16_t *row_b = (const uint16_t *)emb_b + (size_t)token_id * num_groups;
+        dequant_row_q4(ctx->scratch.hidden, row_w, row_s, row_b, K, group_size);
+    }
 }
 
 static void compute_logits(InferenceContext *ctx) {
@@ -813,13 +949,11 @@ static void compute_logits(InferenceContext *ctx) {
     const void *norm_bf16 = model_get_weight(ctx->model, norm_name, &nsz);
     if (norm_bf16) {
         int H = cfg->hidden_size;
-        float *norm_w = malloc((size_t)H * sizeof(float));
+        float *norm_w = alloca((size_t)H * sizeof(float));
         bf16_to_float_vec(norm_w, norm_bf16, H);
-        float *tmp = malloc((size_t)H * sizeof(float));
+        float *tmp = alloca((size_t)H * sizeof(float));
         cpu_rmsnorm(tmp, ctx->scratch.hidden, norm_w, H, cfg->rms_norm_eps);
         memcpy(ctx->scratch.hidden, tmp, (size_t)H * sizeof(float));
-        free(tmp);
-        free(norm_w);
     }
 
     // lm_head has "language_model." prefix in the weight index
@@ -852,59 +986,116 @@ int inference_generate(InferenceContext *ctx,
         ctx->kv_idx = 0;
         ctx->dn_idx = 0;
         embed_token(ctx, prompt_tokens[i]);
-
-        for (int l = 0; l < cfg->num_hidden_layers; l++) {
-            forward_layer(ctx, l);
+        _embed_diag++;
+        if (_embed_diag == 1) {
+            fprintf(stderr, "[EMBED] token_id=%d rms=%.6f first8=[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                    prompt_tokens[i], _diag_rms(ctx->scratch.hidden, model_config(ctx->model)->hidden_size),
+                    ctx->scratch.hidden[0], ctx->scratch.hidden[1],
+                    ctx->scratch.hidden[2], ctx->scratch.hidden[3],
+                    ctx->scratch.hidden[4], ctx->scratch.hidden[5],
+                    ctx->scratch.hidden[6], ctx->scratch.hidden[7]);
         }
+
+        _timing_reset();
+        if (ctx->v4) {
+            v4_timing_reset();
+            v4_init_hc_state(ctx->v4, ctx->scratch.hidden, cfg->hidden_size);
+            for (int l = 0; l < cfg->num_hidden_layers; l++)
+                v4_forward_layer(ctx->v4, l, i, prompt_tokens[i]);
+        } else {
+            for (int l = 0; l < cfg->num_hidden_layers; l++)
+                forward_layer(ctx, l);
 #ifdef PLATFORM_MACOS
-        complete_deferred_experts(ctx);
+            complete_deferred_experts(ctx);
 #endif
+        }
+        if (_diag_first_token) {
+            if (ctx->v4) v4_timing_report(0);
+            else { _timing_report(0); attention_dn_timing_report(0); }
+        }
     }
 
     uint64_t t_prefill = timer_now_ns();
+    _diag_first_token = 0;
     LOG_INFO("inference: prefill done in %.1f ms",
              timer_elapsed_ms(t_start, t_prefill));
 
     // Compute logits from the last prefill hidden state
-    compute_logits(ctx);
+    if (ctx->v4) {
+        v4_compute_logits(ctx->v4, ctx->scratch.logits);
+    } else {
+        compute_logits(ctx);
+    }
 
     // Generate tokens
     int32_t next_token = -1;
+    double _acc_logits = 0, _acc_sample = 0, _acc_embed = 0, _acc_defer = 0, _acc_full = 0;
 
     for (int t = 0; t < max_tokens; t++) {
+        uint64_t _tf0 = timer_now_ns();
         if (t > 0) {
             ctx->position = num_prompt_tokens + t - 1;
             ctx->kv_idx = 0;
             ctx->dn_idx = 0;
 
+            uint64_t _te0 = timer_now_ns();
             embed_token(ctx, next_token);
+            uint64_t _te1 = timer_now_ns();
+            _acc_embed += timer_elapsed_ms(_te0, _te1);
 
-            for (int l = 0; l < cfg->num_hidden_layers; l++) {
-                forward_layer(ctx, l);
-            }
+            _timing_reset();
+            if (ctx->v4) {
+                v4_timing_reset();
+                v4_init_hc_state(ctx->v4, ctx->scratch.hidden, cfg->hidden_size);
+                for (int l = 0; l < cfg->num_hidden_layers; l++)
+                    v4_forward_layer(ctx->v4, l, num_prompt_tokens + t - 1, next_token);
+            } else {
+                for (int l = 0; l < cfg->num_hidden_layers; l++) {
+                    forward_layer(ctx, l);
+                }
 #ifdef PLATFORM_MACOS
-            complete_deferred_experts(ctx);
+                uint64_t _td0 = timer_now_ns();
+                complete_deferred_experts(ctx);
+                uint64_t _td1 = timer_now_ns();
+                _acc_defer += timer_elapsed_ms(_td0, _td1);
 #endif
+            }
+            if (t < 3) {
+                if (ctx->v4) v4_timing_report(t + 1);
+                else { _timing_report(t + 1); attention_dn_timing_report(t + 1); }
+            }
 
-            compute_logits(ctx);
+            uint64_t _tl0 = timer_now_ns();
+            if (ctx->v4) {
+                v4_compute_logits(ctx->v4, ctx->scratch.logits);
+            } else {
+                compute_logits(ctx);
+            }
+            uint64_t _tl1 = timer_now_ns();
+            _acc_logits += timer_elapsed_ms(_tl0, _tl1);
         }
 
         // Sample next token from logits
+        uint64_t _ts0 = timer_now_ns();
         next_token = sampler_sample(sampler, ctx->scratch.logits, cfg->vocab_size);
         sampler_accept(sampler, next_token);
+        uint64_t _ts1 = timer_now_ns();
+        _acc_sample += timer_elapsed_ms(_ts0, _ts1);
         generated++;
+        uint64_t _tf1 = timer_now_ns();
+        _acc_full += timer_elapsed_ms(_tf0, _tf1);
+
+        // Stop on EOS or im_end (before callback so stop tokens don't leak)
+        if (next_token == tokenizer_eos_id(tok) ||
+            next_token == tokenizer_im_end_id(tok)) {
+            LOG_INFO("inference: EOS at token %d", generated);
+            break;
+        }
 
         // Decode and callback
         const char *text = tokenizer_decode(tok, next_token);
         if (callback) {
             callback(next_token, text, userdata);
-        }
-
-        // Stop on EOS or im_end
-        if (next_token == tokenizer_eos_id(tok) ||
-            next_token == tokenizer_im_end_id(tok)) {
-            LOG_INFO("inference: EOS at token %d", generated);
-            break;
         }
     }
 
@@ -912,11 +1103,172 @@ int inference_generate(InferenceContext *ctx,
     double gen_time = timer_elapsed_ms(t_prefill, t_end);
     double tok_per_sec = generated > 0 ? (double)generated / (gen_time / 1000.0) : 0.0;
 
+    if (generated > 1) {
+        int n = generated - 1;
+        LOG_INFO("[CYCLE-TIMING] logits=%.1f embed=%.1f defer=%.1f sample=%.1f full=%.1f avg_full=%.1f ms (%d tokens)",
+                 _acc_logits / n, _acc_embed / n, _acc_defer / n, _acc_sample / n,
+                 _acc_full / n, _acc_full / n, n);
+    }
     LOG_INFO("inference: generated %d tokens in %.1f ms (%.1f tok/s)",
              generated, gen_time, tok_per_sec);
 
     sampler_free(sampler);
     return generated;
+}
+
+
+// --- Split prefill/generate API for system prompt caching ---
+
+void inference_prefill(InferenceContext *ctx,
+                       const int32_t *tokens, int num_tokens,
+                       int start_position) {
+    const ModelConfig *cfg = model_config(ctx->model);
+
+    uint64_t t_start = timer_now_ns();
+
+    for (int i = 0; i < num_tokens; i++) {
+        ctx->position = start_position + i;
+        ctx->kv_idx = 0;
+        ctx->dn_idx = 0;
+        embed_token(ctx, tokens[i]);
+
+        _timing_reset();
+        if (ctx->v4) {
+            v4_timing_reset();
+            v4_init_hc_state(ctx->v4, ctx->scratch.hidden, cfg->hidden_size);
+            for (int l = 0; l < cfg->num_hidden_layers; l++)
+                v4_forward_layer(ctx->v4, l, start_position + i, tokens[i]);
+        } else {
+            for (int l = 0; l < cfg->num_hidden_layers; l++) {
+                forward_layer(ctx, l);
+            }
+#ifdef PLATFORM_MACOS
+            complete_deferred_experts(ctx);
+#endif
+        }
+    }
+
+    // Compute logits from the last hidden state (ready for sampling or continuation)
+    if (num_tokens > 0) {
+        if (ctx->v4) {
+            v4_compute_logits(ctx->v4, ctx->scratch.logits);
+        } else {
+            compute_logits(ctx);
+        }
+    }
+
+    uint64_t t_end = timer_now_ns();
+    LOG_INFO("inference: prefill %d tokens in %.1f ms (start_pos=%d)",
+             num_tokens, timer_elapsed_ms(t_start, t_end), start_position);
+}
+
+int inference_generate_tokens(InferenceContext *ctx,
+                              int total_prompt_tokens,
+                              int max_tokens,
+                              float temperature, float top_p, int top_k,
+                              TokenCallback callback, void *userdata) {
+    const ModelConfig *cfg = model_config(ctx->model);
+    const Tokenizer *tok = model_tokenizer(ctx->model);
+
+    Sampler *sampler = sampler_create(temperature, top_p, top_k, 1.1f, 64);
+
+    int generated = 0;
+    int32_t next_token = -1;
+    double _acc_logits = 0, _acc_sample = 0, _acc_embed = 0, _acc_defer = 0, _acc_full = 0;
+
+    uint64_t t_start = timer_now_ns();
+
+    for (int t = 0; t < max_tokens; t++) {
+        uint64_t _tf0 = timer_now_ns();
+        if (t > 0) {
+            ctx->position = total_prompt_tokens + t - 1;
+            ctx->kv_idx = 0;
+            ctx->dn_idx = 0;
+
+            uint64_t _te0 = timer_now_ns();
+            embed_token(ctx, next_token);
+            uint64_t _te1 = timer_now_ns();
+            _acc_embed += timer_elapsed_ms(_te0, _te1);
+
+            _timing_reset();
+            if (ctx->v4) {
+                v4_timing_reset();
+                v4_init_hc_state(ctx->v4, ctx->scratch.hidden, cfg->hidden_size);
+                for (int l = 0; l < cfg->num_hidden_layers; l++)
+                    v4_forward_layer(ctx->v4, l, total_prompt_tokens + t - 1, next_token);
+            } else {
+                for (int l = 0; l < cfg->num_hidden_layers; l++) {
+                    forward_layer(ctx, l);
+                }
+#ifdef PLATFORM_MACOS
+                uint64_t _td0 = timer_now_ns();
+                complete_deferred_experts(ctx);
+                uint64_t _td1 = timer_now_ns();
+                _acc_defer += timer_elapsed_ms(_td0, _td1);
+#endif
+            }
+            if (t < 3) {
+                if (ctx->v4) v4_timing_report(t + 1);
+                else { _timing_report(t + 1); attention_dn_timing_report(t + 1); }
+            }
+
+            uint64_t _tl0 = timer_now_ns();
+            if (ctx->v4) {
+                v4_compute_logits(ctx->v4, ctx->scratch.logits);
+            } else {
+                compute_logits(ctx);
+            }
+            uint64_t _tl1 = timer_now_ns();
+            _acc_logits += timer_elapsed_ms(_tl0, _tl1);
+        }
+
+        // Sample next token from logits
+        uint64_t _ts0 = timer_now_ns();
+        next_token = sampler_sample(sampler, ctx->scratch.logits, cfg->vocab_size);
+        sampler_accept(sampler, next_token);
+        uint64_t _ts1 = timer_now_ns();
+        _acc_sample += timer_elapsed_ms(_ts0, _ts1);
+        generated++;
+        uint64_t _tf1 = timer_now_ns();
+        _acc_full += timer_elapsed_ms(_tf0, _tf1);
+
+        // Stop on EOS or im_end (before callback so stop tokens don't leak)
+        if (next_token == tokenizer_eos_id(tok) ||
+            next_token == tokenizer_im_end_id(tok)) {
+            LOG_INFO("inference: EOS at token %d", generated);
+            break;
+        }
+
+        // Decode and callback
+        const char *text = tokenizer_decode(tok, next_token);
+        if (callback) {
+            callback(next_token, text, userdata);
+        }
+    }
+
+    uint64_t t_end = timer_now_ns();
+    double gen_time = timer_elapsed_ms(t_start, t_end);
+    double tok_per_sec = generated > 0 ? (double)generated / (gen_time / 1000.0) : 0.0;
+
+    if (generated > 1) {
+        int n = generated - 1;
+        LOG_INFO("[CYCLE-TIMING] logits=%.1f embed=%.1f defer=%.1f sample=%.1f full=%.1f avg_full=%.1f ms (%d tokens)",
+                 _acc_logits / n, _acc_embed / n, _acc_defer / n, _acc_sample / n,
+                 _acc_full / n, _acc_full / n, n);
+    }
+    LOG_INFO("inference: generated %d tokens in %.1f ms (%.1f tok/s)",
+             generated, gen_time, tok_per_sec);
+
+    sampler_free(sampler);
+    return generated;
+}
+
+InferenceCache *inference_get_cache(InferenceContext *ctx) {
+    return ctx->cache;
+}
+
+void inference_reset_v4_state(InferenceContext *ctx) {
+    if (ctx && ctx->v4) v4_reset_state(ctx->v4);
 }
 
 void inference_free(InferenceContext *ctx) {
@@ -930,6 +1282,7 @@ void inference_free(InferenceContext *ctx) {
         ctx->scratch.hidden = NULL;
         ctx->scratch.norm_out = NULL;
         ctx->scratch.logits = NULL;
+        ctx->scratch.gate_logits = NULL;
         metal_free_buffer(ctx->gpu_hidden);
         metal_free_buffer(ctx->gpu_norm_out);
         metal_free_buffer(ctx->gpu_out);
@@ -951,6 +1304,9 @@ void inference_free(InferenceContext *ctx) {
         }
     }
 #endif
+
+    if (ctx->v4)
+        v4_inference_free(ctx->v4);
 
     free_scratch(&ctx->scratch);
     arena_destroy(&ctx->arena);
