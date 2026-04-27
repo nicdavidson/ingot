@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "config/config.h"
+
 // Message roles
 typedef enum {
     ROLE_SYSTEM,
@@ -35,10 +37,13 @@ typedef struct {
     const char *json; // full JSON tool definition
 } ToolDef;
 
-// Format a conversation into the Qwen ChatML prompt string.
+// Format a conversation into the prompt string for the given architecture.
+// ARCH_QWEN35      → ChatML (<|im_start|>...<|im_end|>)
+// ARCH_DEEPSEEK_V4 → DeepSeek V4 chat (<｜User｜>/<｜Assistant｜>/<｜end▁of▁sentence｜>)
 // Writes into buf, returns number of bytes written (not including NUL).
 // If buf is NULL, returns required size.
-int template_apply(const ChatMessage *messages, int num_messages,
+int template_apply(ModelArch arch,
+                   const ChatMessage *messages, int num_messages,
                    const ToolDef *tools, int num_tools,
                    bool add_generation_prompt,
                    bool enable_thinking,

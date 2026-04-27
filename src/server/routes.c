@@ -15,7 +15,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <time.h>
+
+// --- Persistent inference context and prompt cache ---
+// Server is single-threaded, so globals are safe.
+static InferenceContext *g_ictx = NULL;
+static CacheSnapshot   *g_prefix_snap = NULL;
+static int32_t         *g_prefix_tokens = NULL;
+static int              g_prefix_len = 0;
 
 // Send a simple HTTP response
 static void send_response(int fd, int status, const char *status_text,
@@ -52,6 +60,8 @@ static void handle_health(int fd) {
     jw_object_start(&w);
     jw_key(&w, "status"); jw_string(&w, "ok");
     jw_key(&w, "version"); jw_string(&w, "0.1.0");
+    jw_key(&w, "cached_prefix");
+    jw_int(&w, g_prefix_len);
     jw_object_end(&w);
     buf[jw_length(&w)] = '\0';
     send_json(fd, 200, "OK", buf);
@@ -86,13 +96,14 @@ typedef struct {
     char        content_buf[65536];
     int         content_len;
     bool        stream;
+    bool        client_gone;   // set when write fails — stop sending, keep generating
 } StreamCtx;
 
 static void stream_callback(int32_t token_id, const char *text, void *userdata) {
     (void)token_id;
     StreamCtx *sctx = userdata;
 
-    // Accumulate content for non-streaming mode
+    // Always accumulate content (needed for non-streaming response + cache warmup)
     size_t tlen = strlen(text);
     if (sctx->content_len + (int)tlen < (int)sizeof(sctx->content_buf) - 1) {
         memcpy(sctx->content_buf + sctx->content_len, text, tlen);
@@ -100,22 +111,77 @@ static void stream_callback(int32_t token_id, const char *text, void *userdata) 
         sctx->content_buf[sctx->content_len] = '\0';
     }
 
-    if (sctx->stream) {
-        // Send SSE chunk
+    if (sctx->stream && !sctx->client_gone) {
+        // Send SSE chunk — detect broken pipe
         char chunk[4096];
         int clen = sse_format_chunk(chunk, sizeof(chunk),
                                     sctx->model_name, text, NULL,
                                     sctx->chunk_id, 0);
-        sse_write_event(sctx->fd, chunk, (size_t)clen);
+        ssize_t r = write(sctx->fd, "data: ", 6);
+        if (r < 0) {
+            sctx->client_gone = true;
+            LOG_WARN("stream: client disconnected, continuing generation for cache");
+        } else {
+            write(sctx->fd, chunk, (size_t)clen);
+            write(sctx->fd, "\n\n", 2);
+        }
     }
 
     sctx->token_count++;
+}
+
+// Compute the "static prefix" = template(system_messages + tools) token count.
+// Returns the token count, and fills prefix_tokens_out / prefix_len_out.
+// Caller must free *prefix_tokens_out.
+static int compute_prefix(ModelArch arch,
+                          const ChatMessage *messages, int num_messages,
+                          const ToolDef *tools, int num_tools,
+                          const Tokenizer *tok,
+                          int32_t **prefix_tokens_out) {
+    // Count leading system messages
+    int sys_count = 0;
+    for (int i = 0; i < num_messages; i++) {
+        if (messages[i].role == ROLE_SYSTEM) sys_count++;
+        else break;
+    }
+    if (sys_count == 0 && num_tools == 0) return 0;
+
+    // Template just the prefix: system messages + tools, no generation prompt
+    int prefix_text_size = template_apply(arch, messages, sys_count,
+                                          tools, num_tools,
+                                          false, false, NULL, 0);
+    if (prefix_text_size <= 0) return 0;
+
+    char *prefix_text = malloc((size_t)prefix_text_size + 1);
+    template_apply(arch, messages, sys_count, tools, num_tools,
+                   false, false, prefix_text, (size_t)prefix_text_size + 1);
+
+    // Tokenize
+    int max_tokens = prefix_text_size + 100;
+    int32_t *tokens = malloc(sizeof(int32_t) * (size_t)max_tokens);
+    int n = tokenizer_encode(tok, prefix_text, (size_t)prefix_text_size,
+                             tokens, max_tokens);
+    free(prefix_text);
+
+    if (n <= 0) {
+        free(tokens);
+        return 0;
+    }
+
+    *prefix_tokens_out = tokens;
+    return n;
 }
 
 static void handle_chat_completions(int fd, const HttpRequest *req, Model *model) {
     if (!req->body) {
         send_json(fd, 400, "Bad Request", "{\"error\":\"missing request body\"}");
         return;
+    }
+
+    // Lazy-init persistent inference context
+    if (!g_ictx) {
+        g_ictx = inference_create(model);
+        LOG_INFO("routes: created persistent inference context");
     }
 
     // Parse request JSON
@@ -176,30 +242,31 @@ static void handle_chat_completions(int fd, const HttpRequest *req, Model *model
 
     // Parse tools if present
     int tools_idx = json_get(&doc, 0, "tools");
-    ToolDef *tools = NULL;
+    ToolDef *tools_arr = NULL;
     int num_tools = 0;
     if (tools_idx >= 0) {
         num_tools = json_array_len(&doc, tools_idx);
-        tools = calloc((size_t)num_tools, sizeof(ToolDef));
+        tools_arr = calloc((size_t)num_tools, sizeof(ToolDef));
         for (int i = 0; i < num_tools; i++) {
             int tool_idx = json_array_get(&doc, tools_idx, i);
             if (tool_idx >= 0) {
-                // Store the raw JSON substring for the tool definition
-                tools[i].json = strndup(doc.tokens[tool_idx].start,
-                                        doc.tokens[tool_idx].len);
+                tools_arr[i].json = strndup(doc.tokens[tool_idx].start,
+                                            doc.tokens[tool_idx].len);
             }
         }
     }
 
-    // Apply chat template
-    int prompt_size = template_apply(messages, num_messages,
-                                     tools, num_tools,
+    // Apply chat template (full prompt)
+    const ModelConfig *mcfg = model_config(model);
+    ModelArch arch = mcfg ? mcfg->arch : ARCH_QWEN35;
+    int prompt_size = template_apply(arch, messages, num_messages,
+                                     tools_arr, num_tools,
                                      true, true, NULL, 0);
     char *prompt = malloc((size_t)prompt_size + 1);
-    template_apply(messages, num_messages, tools, num_tools,
+    template_apply(arch, messages, num_messages, tools_arr, num_tools,
                    true, true, prompt, (size_t)prompt_size + 1);
 
-    // Tokenize prompt
+    // Tokenize full prompt
     const Tokenizer *tok = model_tokenizer(model);
     int32_t *prompt_tokens = malloc(sizeof(int32_t) * (size_t)(prompt_size + 100));
     int num_prompt_tokens = tokenizer_encode(tok, prompt, (size_t)prompt_size,
@@ -208,14 +275,68 @@ static void handle_chat_completions(int fd, const HttpRequest *req, Model *model
     LOG_INFO("api: chat completions (messages=%d, prompt_tokens=%d, max=%d, stream=%d)",
              num_messages, num_prompt_tokens, max_tokens_val, stream);
 
+    // --- System prompt caching logic ---
+    int prefill_skip = 0;
+
+    // Check for existing prefix cache hit
+    if (g_prefix_snap && g_prefix_len > 0 &&
+        num_prompt_tokens > g_prefix_len &&
+        memcmp(prompt_tokens, g_prefix_tokens,
+               sizeof(int32_t) * (size_t)g_prefix_len) == 0) {
+        // Cache hit — restore snapshot
+        cache_snapshot_restore(inference_get_cache(g_ictx), g_prefix_snap);
+        prefill_skip = g_prefix_len;
+        LOG_INFO("api: PREFIX CACHE HIT — skipping %d of %d tokens (%.1f%%)",
+                 prefill_skip, num_prompt_tokens,
+                 100.0 * (double)prefill_skip / (double)num_prompt_tokens);
+    } else {
+        // Cache miss — reset and compute new prefix
+        cache_reset(inference_get_cache(g_ictx));
+
+        // Try to compute and cache the prefix for future requests
+        int32_t *new_prefix_tokens = NULL;
+        int new_prefix_len = compute_prefix(arch, messages, num_messages,
+                                            tools_arr, num_tools,
+                                            tok, &new_prefix_tokens);
+
+        if (new_prefix_len > 0 && new_prefix_len < num_prompt_tokens &&
+            memcmp(prompt_tokens, new_prefix_tokens,
+                   sizeof(int32_t) * (size_t)new_prefix_len) == 0) {
+            // Prefill prefix portion first
+            LOG_INFO("api: caching prefix (%d tokens) for future requests", new_prefix_len);
+            inference_prefill(g_ictx, prompt_tokens, new_prefix_len, 0);
+
+            // Snapshot the state after prefix prefill
+            if (g_prefix_snap) cache_snapshot_free(g_prefix_snap);
+            g_prefix_snap = cache_snapshot_save(inference_get_cache(g_ictx),
+                                                new_prefix_len);
+
+            // Update cached prefix tokens
+            free(g_prefix_tokens);
+            g_prefix_tokens = new_prefix_tokens;
+            g_prefix_len = new_prefix_len;
+
+            // Continue with remaining tokens
+            prefill_skip = new_prefix_len;
+        } else {
+            // No usable prefix — full prefill
+            free(new_prefix_tokens);
+            prefill_skip = 0;
+        }
+    }
+
+    // Prefill remaining tokens
+    int remaining_tokens = num_prompt_tokens - prefill_skip;
+    if (remaining_tokens > 0) {
+        inference_prefill(g_ictx, prompt_tokens + prefill_skip,
+                          remaining_tokens, prefill_skip);
+    }
+
     // Generate a request ID
     char chunk_id[64];
     snprintf(chunk_id, sizeof(chunk_id), "chatcmpl-%lld", (long long)time(NULL));
 
     const ModelConfig *cfg = model_config(model);
-
-    // Create inference context
-    InferenceContext *ictx = inference_create(model);
 
     StreamCtx sctx = {
         .fd = fd,
@@ -233,19 +354,21 @@ static void handle_chat_completions(int fd, const HttpRequest *req, Model *model
         sse_write_event(fd, role_chunk, (size_t)rclen);
     }
 
-    // Run inference
-    int generated = inference_generate(ictx, prompt_tokens, num_prompt_tokens,
-                                       max_tokens_val,
-                                       temperature, top_p, top_k_val,
-                                       stream_callback, &sctx);
+    // Generate
+    int generated = inference_generate_tokens(g_ictx, num_prompt_tokens,
+                                              max_tokens_val,
+                                              temperature, top_p, top_k_val,
+                                              stream_callback, &sctx);
 
-    if (stream) {
+    if (stream && !sctx.client_gone) {
         // Send final chunk with finish_reason
         char final_chunk[1024];
         int fclen = sse_format_chunk(final_chunk, sizeof(final_chunk),
                                      cfg->model_name, NULL, "stop", chunk_id, 0);
         sse_write_event(fd, final_chunk, (size_t)fclen);
         sse_write_done(fd);
+    } else if (stream && sctx.client_gone) {
+        LOG_INFO("api: client disconnected during generation (%d tokens generated)", generated);
     } else {
         // Non-streaming: build complete response
         // Strip think tags
@@ -311,6 +434,10 @@ static void handle_chat_completions(int fd, const HttpRequest *req, Model *model
         jw_key(&w, "prompt_tokens"); jw_int(&w, num_prompt_tokens);
         jw_key(&w, "completion_tokens"); jw_int(&w, generated);
         jw_key(&w, "total_tokens"); jw_int(&w, num_prompt_tokens + generated);
+        jw_key(&w, "usage_details");
+        jw_object_start(&w);
+        jw_key(&w, "cached_tokens"); jw_int(&w, prefill_skip);
+        jw_object_end(&w);
         jw_object_end(&w);
 
         jw_object_end(&w);
@@ -319,8 +446,7 @@ static void handle_chat_completions(int fd, const HttpRequest *req, Model *model
         send_json(fd, 200, "OK", response);
     }
 
-    // Cleanup
-    inference_free(ictx);
+    // NOTE: Do NOT free g_ictx — it persists across requests
     free(prompt_tokens);
     free(prompt);
     for (int i = 0; i < num_messages; i++) {
@@ -328,9 +454,9 @@ static void handle_chat_completions(int fd, const HttpRequest *req, Model *model
     }
     free(messages);
     for (int i = 0; i < num_tools; i++) {
-        free((void *)tools[i].json);
+        free((void *)tools_arr[i].json);
     }
-    free(tools);
+    free(tools_arr);
 }
 
 static void handle_options(int fd) {

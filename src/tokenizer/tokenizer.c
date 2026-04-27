@@ -439,10 +439,23 @@ Tokenizer *tokenizer_load(const char *model_dir) {
         load_added_tokens(tok, path);
     }
 
-    // Resolve special token IDs
+    // Resolve special token IDs.
+    // Try Qwen 3.5 names first (<|endoftext|>, <|im_start|>, <|im_end|>),
+    // fall back to DeepSeek V4 names (<｜end▁of▁sentence｜>, <｜User｜>, <｜Assistant｜>).
+    // V4 has no <|im_end|> analog — assistant turns end with EOS — so im_end_id
+    // is set to eos_id when the Qwen name is absent so the inference stop check
+    // remains correct without a separate branch.
     tok->eos_id = hashmap_get(&tok->token_to_id, "<|endoftext|>", -1);
+    if (tok->eos_id < 0)
+        tok->eos_id = hashmap_get(&tok->token_to_id, "<｜end▁of▁sentence｜>", -1);
+
     tok->im_start_id = hashmap_get(&tok->token_to_id, "<|im_start|>", -1);
+    if (tok->im_start_id < 0)
+        tok->im_start_id = hashmap_get(&tok->token_to_id, "<｜Assistant｜>", -1);
+
     tok->im_end_id = hashmap_get(&tok->token_to_id, "<|im_end|>", -1);
+    if (tok->im_end_id < 0)
+        tok->im_end_id = tok->eos_id;
 
     LOG_INFO("tokenizer: eos=%d, im_start=%d, im_end=%d",
              tok->eos_id, tok->im_start_id, tok->im_end_id);

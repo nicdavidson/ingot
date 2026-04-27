@@ -98,11 +98,75 @@ static void write_tool_calls(Writer *w, const ToolCall *calls, int n,
     }
 }
 
-int template_apply(const ChatMessage *messages, int num_messages,
+// DeepSeek V4 chat template — see chat_template.jinja in the model dir.
+// Layout (no inter-message newlines):
+//   <｜begin▁of▁sentence｜>
+//   {system_content}                                        (if any, raw, no wrapper)
+//   <｜User｜>{user}<｜Assistant｜>{<think> | </think>}{assistant}<｜end▁of▁sentence｜>
+//   ...
+//   {generation_prompt: <｜Assistant｜></think>}            (if add_generation_prompt)
+//
+// Tool calling is not yet wired in for V4 — Phase B / Hermes integration.
+static int template_apply_v4(const ChatMessage *messages, int num_messages,
+                             bool add_generation_prompt,
+                             bool enable_thinking,
+                             char *buf, size_t buf_size) {
+    Writer w = { .buf = buf, .cap = buf_size, .len = 0 };
+
+    w_str(&w, "<｜begin▁of▁sentence｜>");
+
+    for (int i = 0; i < num_messages; i++) {
+        const ChatMessage *msg = &messages[i];
+        switch (msg->role) {
+            case ROLE_SYSTEM:
+                if (msg->content) w_str(&w, msg->content);
+                break;
+            case ROLE_USER:
+                w_str(&w, "<｜User｜>");
+                if (msg->content) w_str(&w, msg->content);
+                w_str(&w, "<｜Assistant｜>");
+                // Per the jinja: thinking-mode opens <think> only on the
+                // last user message; otherwise close it as </think>.
+                if (i + 1 == num_messages && enable_thinking)
+                    w_str(&w, "<think>");
+                else
+                    w_str(&w, "</think>");
+                break;
+            case ROLE_ASSISTANT:
+                if (msg->content) w_str(&w, msg->content);
+                w_str(&w, "<｜end▁of▁sentence｜>");
+                break;
+            case ROLE_TOOL:
+                // V4 tool-output format not yet implemented — emit as plain
+                // user content so generation can still proceed.
+                w_str(&w, "<｜User｜>");
+                if (msg->content) w_str(&w, msg->content);
+                w_str(&w, "<｜Assistant｜></think>");
+                break;
+        }
+    }
+
+    if (add_generation_prompt &&
+        (num_messages == 0 || messages[num_messages - 1].role != ROLE_USER)) {
+        w_str(&w, "<｜Assistant｜></think>");
+    }
+
+    if (w.buf && w.len < w.cap) w.buf[w.len] = '\0';
+    return (int)w.len;
+}
+
+int template_apply(ModelArch arch,
+                   const ChatMessage *messages, int num_messages,
                    const ToolDef *tools, int num_tools,
                    bool add_generation_prompt,
                    bool enable_thinking,
                    char *buf, size_t buf_size) {
+    if (arch == ARCH_DEEPSEEK_V4) {
+        return template_apply_v4(messages, num_messages,
+                                 add_generation_prompt, enable_thinking,
+                                 buf, buf_size);
+    }
+
     Writer w = { .buf = buf, .cap = buf_size, .len = 0 };
 
     bool has_tools = (tools && num_tools > 0);
