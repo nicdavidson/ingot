@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 // --- Internal parser state ---
 
@@ -236,6 +237,53 @@ int json_get(const JsonDoc *doc, int obj_idx, const char *key) {
     return -1;
 }
 
+// Parse 4 hex digits at src[0..3] into a uint16. Returns -1 on bad input.
+static int parse_hex4(const char *src) {
+    int v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = src[i];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = 10 + c - 'a';
+        else if (c >= 'A' && c <= 'F') d = 10 + c - 'A';
+        else return -1;
+        v = (v << 4) | d;
+    }
+    return v;
+}
+
+// Encode a Unicode codepoint as UTF-8 into buf. Returns bytes written (1-4),
+// or 0 if the codepoint is invalid or buf has insufficient space.
+static int encode_utf8(uint32_t cp, char *buf, size_t cap) {
+    if (cp < 0x80) {
+        if (cap < 1) return 0;
+        buf[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        if (cap < 2) return 0;
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        if (cap < 3) return 0;
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    if (cp < 0x110000) {
+        if (cap < 4) return 0;
+        buf[0] = (char)(0xF0 | (cp >> 18));
+        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[3] = (char)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+    return 0;
+}
+
 bool json_string(const JsonDoc *doc, int idx, char *buf, size_t buf_size) {
     if (idx < 0 || idx >= doc->num_tokens) return false;
     if (doc->tokens[idx].type != JSON_STRING) return false;
@@ -256,6 +304,27 @@ bool json_string(const JsonDoc *doc, int idx, char *buf, size_t buf_size) {
                 case 't':  buf[out++] = '\t'; break;
                 case 'b':  buf[out++] = '\b'; break;
                 case 'f':  buf[out++] = '\f'; break;
+                case 'u': {
+                    // \uXXXX — decode 4 hex digits to a codepoint, with
+                    // optional surrogate pair handling for codepoints > U+FFFF.
+                    if (i + 4 >= slen) { buf[out++] = src[i]; break; }
+                    int hi = parse_hex4(src + i + 1);
+                    if (hi < 0) { buf[out++] = src[i]; break; }
+                    i += 4;
+                    uint32_t cp = (uint32_t)hi;
+                    if (cp >= 0xD800 && cp <= 0xDBFF &&
+                        i + 6 < slen && src[i + 1] == '\\' && src[i + 2] == 'u') {
+                        int lo = parse_hex4(src + i + 3);
+                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            i += 6;
+                        }
+                    }
+                    int n = encode_utf8(cp, buf + out, buf_size - 1 - out);
+                    if (n <= 0) { buf[out] = '\0'; return true; }
+                    out += (size_t)n;
+                    break;
+                }
                 default:   buf[out++] = src[i]; break;
             }
         } else {
