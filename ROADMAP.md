@@ -37,6 +37,27 @@ Speed is ~0.03 tok/s because routed experts run on CPU instead of GPU — see "R
 
 ## Remaining work (in priority order)
 
+### P0 (NEW after second session): Diff against reference impl
+
+We've done every "obvious" piece — Compressor, FP8 sim, attn_sink, output
+RoPE inverse, K=V cache, per-layer rope theta, MXFP4, HC math fixes — and
+output is still incoherent on `"What is the capital of France?"`. With and
+without the Compressor produces different gibberish, with and without FP8
+sim produces different gibberish — meaning each piece is structurally
+contributing but something subtle is still wrong.
+
+The cheapest path forward is **diff against the reference impl tensor-by-tensor**:
+- Reference: `/Users/nic/models/DeepSeek-V4-Flash/inference/generate.py` +
+  `model.py` (PyTorch + tilelang).
+- `tilelang` is now installed on the Mac. `fast_hadamard_transform` is the
+  only remaining missing dep — it's used by the Indexer's `rotate_activation`
+  and won't compile without CUDA. Workaround: edit `model.py` to replace
+  `rotate_activation` with a Python Walsh-Hadamard transform (~10 lines),
+  OR run with `--input-file` of a 4-token prompt where the indexer doesn't
+  fire (still depends on it being defined at import time? — check).
+- Add per-layer hidden-state dumps to a file from both my `v4_forward.c` and
+  the reference. Numpy-diff. First diverging layer localizes the bug.
+
 ### P1: Fix output quality — still gibberish
 
 Pipeline is numerically clean (no NaN/Inf, healthy norms, sensible logit distributions)
