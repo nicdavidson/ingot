@@ -1127,6 +1127,27 @@ void v4_forward_layer(V4InferenceContext *ctx, int layer_idx, int position, int 
     // HC post for FFN
     v4_hc_post(ctx, ctx->sublayer_out, ffn_post, ffn_comb);
 
+    // Diff-debug hook: dump hc_state at end of each layer when INGOT_DUMP_LAYERS
+    // env var is set. Set position cap (e.g. INGOT_DUMP_AT_POS=29) to dump only
+    // for the last prefill token. Files: /tmp/ingot_h_LL.bin, F32 [hc_mult, H].
+    {
+        const char *dump_dir = getenv("INGOT_DUMP_LAYERS");
+        if (dump_dir) {
+            const char *pos_str = getenv("INGOT_DUMP_AT_POS");
+            int target_pos = pos_str ? atoi(pos_str) : -1;
+            if (target_pos < 0 || position == target_pos) {
+                char path[256];
+                snprintf(path, sizeof(path), "%s/ingot_h_%02d.bin", dump_dir, layer_idx);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(ctx->hc_state, sizeof(float),
+                           (size_t)M * (size_t)H, f);
+                    fclose(f);
+                }
+            }
+        }
+    }
+
     _t1 = timer_now_ns(); _v4_acc_routed += timer_elapsed_ms(_t0, _t1);
 
     arena_reset(&ctx->arena);
