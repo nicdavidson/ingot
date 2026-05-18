@@ -20,7 +20,7 @@ inline float bf16_to_float(ushort val) {
     return as_type<float>(uint(val) << 16);
 }
 
-constant uint MAX_SHARED_DIM = 4096;
+constant uint MAX_SHARED_DIM = 8192;
 
 kernel void fused_gate_up_swiglu(
     // Gate projection weights
@@ -47,18 +47,21 @@ kernel void fused_gate_up_swiglu(
     uint row = tg_id;
     if (row >= moe_dim) return;
 
-    // Cache input in shared memory (loaded once, used twice)
-    threadgroup float x_shared[MAX_SHARED_DIM];
-    uint k4 = K / 4;
-    for (uint i = tid; i < k4; i += 256) {
-        float4 val = *reinterpret_cast<device const float4 *>(x + i * 4);
-        x_shared[i * 4]     = val.x;
-        x_shared[i * 4 + 1] = val.y;
-        x_shared[i * 4 + 2] = val.z;
-        x_shared[i * 4 + 3] = val.w;
-    }
-    for (uint i = k4 * 4 + tid; i < K; i += 256) {
-        x_shared[i] = x[i];
+    // Cache input in shared memory (loaded once, used twice for gate and up)
+    threadgroup half x_shared[MAX_SHARED_DIM];
+    bool use_shared = (K <= MAX_SHARED_DIM);
+    if (use_shared) {
+        uint k4 = K / 4;
+        for (uint i = tid; i < k4; i += 256) {
+            float4 val = *reinterpret_cast<device const float4 *>(x + i * 4);
+            x_shared[i * 4]     = half(val.x);
+            x_shared[i * 4 + 1] = half(val.y);
+            x_shared[i * 4 + 2] = half(val.z);
+            x_shared[i * 4 + 3] = half(val.w);
+        }
+        for (uint i = k4 * 4 + tid; i < K; i += 256) {
+            x_shared[i] = half(x[i]);
+        }
     }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
@@ -93,7 +96,7 @@ kernel void fused_gate_up_swiglu(
         // Pre-compute scale*x and bias*x, accumulate bias terms,
         // then FMA nibble * sx into running sums
         for (uint b = 0; b < 8; b++) {
-            float xv = x_shared[k_base + b];
+            float xv = use_shared ? float(x_shared[k_base + b]) : x[k_base + b];
             float gsx = gscale * xv, gbx = gbias * xv;
             float usx = uscale * xv, ubx = ubias * xv;
             gate_sum += gbx;
